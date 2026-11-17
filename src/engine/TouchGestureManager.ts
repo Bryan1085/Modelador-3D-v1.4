@@ -49,7 +49,7 @@ export const TOUCH_MODIFIER_REGISTRY: TouchModifierDescriptor[] = [
     badgeText: 'CTRL',
     implemented: true,
     description:
-      'Botón flotante conectado al estado de modificador CTRL de teclado (ej. Ctrl+Z Deshacer, Ctrl+Shift+Z Rehacer, Ctrl+S Guardar).',
+      'CTRL + arrastre: rotación libre (trackball virtual) de objetos o geometría seleccionada. Combinaciones: Ctrl+Shift (Primitivas), Ctrl+Alt (Operaciones especiales), Ctrl+Z / Ctrl+S.',
   },
   {
     key: 'alt',
@@ -57,7 +57,7 @@ export const TOUCH_MODIFIER_REGISTRY: TouchModifierDescriptor[] = [
     badgeText: 'ALT',
     implemented: true,
     description:
-      'Botón flotante conectado al estado de modificador ALT de teclado (ej. Alt+A Deseleccionar todo, Alt+O Solo conectados).',
+      'ALT + toque en el visor: alternar entre Modo Objeto y Modo Edición. Combinaciones: Ctrl+Alt (Operaciones especiales), Alt+A (Deseleccionar), Alt+O (Solo conectados).',
   },
 ];
 
@@ -71,6 +71,8 @@ export interface TouchGestureCallbacks {
   isGizmoBusy: () => boolean;
   isBoxSelectDisabled?: () => boolean;
   isShiftHoldDisabled?: () => boolean;
+  isTrackballDisabled?: () => boolean;
+  canTrackballRotate?: () => boolean;
   getWorkMode: () => WorkMode;
   hasLongPressTarget?: (
     clientX: number,
@@ -84,6 +86,7 @@ export interface TouchGestureCallbacks {
     modifiers: TouchModifierState,
     shiftKey: boolean,
   ) => void;
+  onAltTap?: () => void;
   onTwoFingerTap: () => void;
   onThreeFingerTap: () => void;
   onLongPress: (clientX: number, clientY: number, pointerType: string) => void;
@@ -103,6 +106,15 @@ export interface TouchGestureCallbacks {
     shiftKey: boolean,
   ) => void;
   onBoxSelectCancel?: () => void;
+  onTrackballRotateStart?: (clientX: number, clientY: number) => void;
+  onTrackballRotateMove?: (clientX: number, clientY: number) => void;
+  onTrackballRotateEnd?: () => void;
+  onTrackballRotateCancel?: () => void;
+  isModalTransformArmed?: () => boolean;
+  onModalTransformStart?: (clientX: number, clientY: number) => void;
+  onModalTransformMove?: (clientX: number, clientY: number) => void;
+  onModalTransformEnd?: () => void;
+  onModalTransformCancel?: () => void;
   onModifierStateChange?: (modifiers: TouchModifierState) => void;
   onTouchNavigationChange: (
     activePointers: ReadonlyMap<number, TrackedPointer>,
@@ -130,6 +142,26 @@ interface ArmedBoxSelectState {
   activeDrag: boolean;
 }
 
+interface ArmedTrackballState {
+  pointerId: number;
+  pointerType: string;
+  startX: number;
+  startY: number;
+  currX: number;
+  currY: number;
+  activeDrag: boolean;
+}
+
+interface ArmedModalDragState {
+  pointerId: number;
+  pointerType: string;
+  startX: number;
+  startY: number;
+  currX: number;
+  currY: number;
+  activeDrag: boolean;
+}
+
 const LONG_PRESS_MS = 500;
 const LONG_PRESS_MOVE_LIMIT_PX = 10;
 const SHIFT_HOLD_DELAY_MS = 170;
@@ -144,6 +176,8 @@ const TWO_FINGER_TAP_MAX_MS = 360;
 const THREE_FINGER_TAP_MOVE_PX = 28;
 const THREE_FINGER_TAP_MAX_MS = 420;
 const BOX_SELECT_DRAG_THRESHOLD_PX = 7;
+const TRACKBALL_DRAG_THRESHOLD_PX = 6;
+const MODAL_DRAG_THRESHOLD_PX = 4;
 const DOUBLE_TAP_MAX_DISTANCE_TOUCH_PX = 36;
 const DOUBLE_TAP_MAX_DISTANCE_MOUSE_PX = 20;
 
@@ -163,7 +197,9 @@ export class TouchGestureManager {
   private shiftHoldActive = false;
   private shiftHoldWasActivated = false;
   private shiftSecondFingerUsed = false;
+  private altTapCandidate = false;
   private secondaryTapCandidate: SecondaryTapCandidate | null = null;
+  private externalModifiers: TouchModifierState = { ...EMPTY_MODIFIER_STATE };
 
   private lastTap: {
     time: number;
@@ -172,6 +208,8 @@ export class TouchGestureManager {
     pointerType: string;
   } | null = null;
   private boxSelectArmed: ArmedBoxSelectState | null = null;
+  private trackballState: ArmedTrackballState | null = null;
+  private modalDragState: ArmedModalDragState | null = null;
 
   private disposed = false;
 
@@ -190,6 +228,7 @@ export class TouchGestureManager {
     this.element.addEventListener('pointercancel', this.handlePointerCancel);
     this.element.addEventListener('contextmenu', this.handleContextMenu);
     window.addEventListener('blur', this.handleWindowBlur);
+    document.addEventListener('visibilitychange', this.handleVisibilityChange);
   }
 
   public getModifierState(): TouchModifierState {
@@ -200,16 +239,51 @@ export class TouchGestureManager {
     };
   }
 
-  private getPointerModifierState(e: PointerEvent): TouchModifierState {
+  public setExternalModifiers(mods: TouchModifierState): void {
+    const next: TouchModifierState = {
+      shift: Boolean(mods.shift),
+      ctrl: Boolean(mods.ctrl),
+      alt: Boolean(mods.alt),
+    };
+    const changed =
+      this.externalModifiers.shift !== next.shift ||
+      this.externalModifiers.ctrl !== next.ctrl ||
+      this.externalModifiers.alt !== next.alt;
+    if (!changed) return;
+    this.externalModifiers = next;
+
+    if (this.trackballState && !(next.ctrl && !next.shift && !next.alt)) {
+      if (this.trackballState.activeDrag) {
+        if (!next.shift && !next.alt) {
+          this.finishTrackball(true);
+        } else {
+          this.cancelTrackball(true);
+        }
+      } else {
+        this.cancelTrackball(true);
+      }
+    }
+  }
+
+  private getEffectiveModifiers(e?: PointerEvent): TouchModifierState {
     return {
-      shift: this.shiftHoldActive || e.shiftKey,
-      ctrl: e.ctrlKey || e.metaKey,
-      alt: e.altKey,
+      shift:
+        this.shiftHoldActive ||
+        this.externalModifiers.shift ||
+        Boolean(e?.shiftKey),
+      ctrl:
+        this.externalModifiers.ctrl ||
+        Boolean(e && (e.ctrlKey || e.metaKey)),
+      alt: this.externalModifiers.alt || Boolean(e?.altKey),
     };
   }
 
   public isBoxSelectBlockingOrbit(): boolean {
-    return this.boxSelectArmed !== null;
+    return (
+      this.boxSelectArmed !== null ||
+      this.trackballState !== null ||
+      this.modalDragState !== null
+    );
   }
 
   public updateConfig(nextConfig: TouchControlSettings): void {
@@ -223,7 +297,7 @@ export class TouchGestureManager {
   }
 
   public syncWorkMode(_workMode: WorkMode): void {
-    // Touch SHIFT hold is supported in both Object Mode and Edit Mode.
+    // Touch modifiers are supported across Object Mode and Edit Mode.
   }
 
   public invalidateCurrentGesture(): void {
@@ -231,6 +305,9 @@ export class TouchGestureManager {
     this.clearShiftHoldTimer();
     this.deactivateShiftHold(true);
     this.cancelBoxSelect(true);
+    this.cancelTrackball(true);
+    this.cancelModalDrag(true);
+    this.altTapCandidate = false;
     this.lastTap = null;
     this.episodeInvalidated = true;
   }
@@ -269,8 +346,59 @@ export class TouchGestureManager {
     if (notify) {
       this.callbacks.onTouchNavigationChange(
         this.pointers,
-        this.getModifierState(),
-        false,
+        this.getEffectiveModifiers(),
+        this.isBoxSelectBlockingOrbit(),
+      );
+    }
+  }
+
+  private cancelTrackball(notify: boolean): void {
+    if (!this.trackballState) return;
+    const state = this.trackballState;
+    this.trackballState = null;
+    this.releaseCaptureSafely(state.pointerId);
+    if (state.activeDrag && notify) {
+      this.callbacks.onTrackballRotateCancel?.();
+    }
+    if (notify) {
+      this.callbacks.onTouchNavigationChange(
+        this.pointers,
+        this.getEffectiveModifiers(),
+        this.isBoxSelectBlockingOrbit(),
+      );
+    }
+  }
+
+  private finishTrackball(notify: boolean): void {
+    if (!this.trackballState) return;
+    const state = this.trackballState;
+    this.trackballState = null;
+    this.releaseCaptureSafely(state.pointerId);
+    if (state.activeDrag && notify) {
+      this.callbacks.onTrackballRotateEnd?.();
+    }
+    if (notify) {
+      this.callbacks.onTouchNavigationChange(
+        this.pointers,
+        this.getEffectiveModifiers(),
+        this.isBoxSelectBlockingOrbit(),
+      );
+    }
+  }
+
+  private cancelModalDrag(notify: boolean): void {
+    if (!this.modalDragState) return;
+    const state = this.modalDragState;
+    this.modalDragState = null;
+    this.releaseCaptureSafely(state.pointerId);
+    if (state.activeDrag && notify) {
+      this.callbacks.onModalTransformCancel?.();
+    }
+    if (notify) {
+      this.callbacks.onTouchNavigationChange(
+        this.pointers,
+        this.getEffectiveModifiers(),
+        this.isBoxSelectBlockingOrbit(),
       );
     }
   }
@@ -305,7 +433,7 @@ export class TouchGestureManager {
       this.callbacks.onModifierStateChange?.(state);
       this.callbacks.onTouchNavigationChange(
         this.pointers,
-        state,
+        this.getEffectiveModifiers(),
         this.isBoxSelectBlockingOrbit(),
       );
     }
@@ -321,6 +449,7 @@ export class TouchGestureManager {
     this.episodeInvalidated = false;
     this.shiftHoldWasActivated = false;
     this.shiftSecondFingerUsed = false;
+    this.altTapCandidate = false;
   }
 
   private handleContextMenu = (e: MouseEvent) => {
@@ -329,11 +458,19 @@ export class TouchGestureManager {
     }
   };
 
+  private handleVisibilityChange = () => {
+    if (document.hidden) {
+      this.handleWindowBlur();
+    }
+  };
+
   private handleWindowBlur = () => {
     const hadShift = this.shiftHoldActive;
     this.clearLongPressTimer();
     this.clearShiftHoldTimer();
     this.cancelBoxSelect(true);
+    this.cancelTrackball(true);
+    this.cancelModalDrag(true);
     this.lastTap = null;
     this.pointers.clear();
     this.resetEpisode();
@@ -341,7 +478,11 @@ export class TouchGestureManager {
     if (hadShift) {
       this.callbacks.onModifierStateChange?.(state);
     }
-    this.callbacks.onTouchNavigationChange(this.pointers, state, false);
+    this.callbacks.onTouchNavigationChange(
+      this.pointers,
+      this.getEffectiveModifiers(),
+      false,
+    );
   };
 
   private handlePointerDown = (e: PointerEvent) => {
@@ -366,21 +507,43 @@ export class TouchGestureManager {
     this.pointers.set(e.pointerId, tracked);
     this.peakCount = Math.max(this.peakCount, this.pointers.size);
 
+    const effMods = this.getEffectiveModifiers(e);
+
     if (this.callbacks.isGizmoBusy()) {
       this.clearLongPressTimer();
       this.deactivateShiftHold(true);
       this.cancelBoxSelect(true);
+      this.cancelTrackball(true);
+      this.cancelModalDrag(true);
       this.lastTap = null;
       this.episodeInvalidated = true;
       this.callbacks.onTouchNavigationChange(
         this.pointers,
-        this.getModifierState(),
+        effMods,
         false,
       );
       return;
     }
 
-    // Multi-finger touch cancels armed pre-drag box selection cleanly so pinch/pan/undo work seamlessly
+    // Multi-finger touch cancels armed pre-drag modal/trackball/box selection cleanly so pinch/pan/undo work seamlessly
+    if (this.pointers.size > 1 && this.modalDragState) {
+      if (!this.modalDragState.activeDrag) {
+        this.cancelModalDrag(true);
+        this.lastTap = null;
+      } else {
+        return;
+      }
+    }
+
+    if (this.pointers.size > 1 && this.trackballState) {
+      if (!this.trackballState.activeDrag) {
+        this.cancelTrackball(true);
+        this.lastTap = null;
+      } else {
+        return;
+      }
+    }
+
     if (this.pointers.size > 1 && this.boxSelectArmed) {
       if (!this.boxSelectArmed.activeDrag) {
         this.cancelBoxSelect(true);
@@ -392,6 +555,79 @@ export class TouchGestureManager {
     }
 
     if (this.pointers.size === 1) {
+      const isValidButton = e.pointerType !== 'mouse' || e.button === 0;
+
+      // ALT + tap -> mode toggle candidate (never triggers box select, long press, or shift hold)
+      if (effMods.alt && !effMods.ctrl && !effMods.shift) {
+        this.lastTap = null;
+        this.clearLongPressTimer();
+        this.clearShiftHoldTimer();
+        this.altTapCandidate = isValidButton;
+        this.callbacks.onTouchNavigationChange(this.pointers, effMods, false);
+        return;
+      }
+
+      // CTRL + drag -> virtual trackball rotation (blocks orbit immediately when armed)
+      if (effMods.ctrl && !effMods.shift && !effMods.alt && isValidButton) {
+        this.lastTap = null;
+        this.clearLongPressTimer();
+        this.clearShiftHoldTimer();
+        const canTrackball =
+          !this.callbacks.isTrackballDisabled?.() &&
+          (this.callbacks.canTrackballRotate?.() ?? true);
+        if (canTrackball) {
+          this.trackballState = {
+            pointerId: e.pointerId,
+            pointerType: e.pointerType,
+            startX: e.clientX,
+            startY: e.clientY,
+            currX: e.clientX,
+            currY: e.clientY,
+            activeDrag: false,
+          };
+          try {
+            this.element.setPointerCapture(e.pointerId);
+          } catch {
+            // Ignore capture error on detached/synthetic events
+          }
+          this.callbacks.onTouchNavigationChange(this.pointers, effMods, true);
+          return;
+        }
+        // Static/non-rotatable CTRL touch should not trigger accidental selection or long press
+        this.episodeInvalidated = true;
+        this.callbacks.onTouchNavigationChange(this.pointers, effMods, true);
+        return;
+      }
+
+      // G Modal Move / Slide -> 1-finger drag directly transforms selection (2 fingers still yield to orbit/zoom/pan!)
+      if (
+        !effMods.ctrl &&
+        !effMods.alt &&
+        !effMods.shift &&
+        isValidButton &&
+        this.callbacks.isModalTransformArmed?.()
+      ) {
+        this.lastTap = null;
+        this.clearLongPressTimer();
+        this.clearShiftHoldTimer();
+        this.modalDragState = {
+          pointerId: e.pointerId,
+          pointerType: e.pointerType,
+          startX: e.clientX,
+          startY: e.clientY,
+          currX: e.clientX,
+          currY: e.clientY,
+          activeDrag: false,
+        };
+        try {
+          this.element.setPointerCapture(e.pointerId);
+        } catch {
+          // Ignore capture error
+        }
+        this.callbacks.onTouchNavigationChange(this.pointers, effMods, true);
+        return;
+      }
+
       const boxEnabled =
         this.config.doubleTapBoxSelect !== false &&
         !this.callbacks.isBoxSelectDisabled?.();
@@ -399,7 +635,6 @@ export class TouchGestureManager {
         180,
         Math.min(600, this.config.doubleTapIntervalMs ?? 320),
       );
-      const isValidButton = e.pointerType !== 'mouse' || e.button === 0;
       const distLimit =
         e.pointerType === 'touch'
           ? DOUBLE_TAP_MAX_DISTANCE_TOUCH_PX
@@ -434,7 +669,7 @@ export class TouchGestureManager {
         }
         this.callbacks.onTouchNavigationChange(
           this.pointers,
-          this.getModifierState(),
+          effMods,
           true,
         );
         return;
@@ -467,7 +702,11 @@ export class TouchGestureManager {
           this.shiftHoldWasActivated = true;
           const state = this.getModifierState();
           this.callbacks.onModifierStateChange?.(state);
-          this.callbacks.onTouchNavigationChange(this.pointers, state, false);
+          this.callbacks.onTouchNavigationChange(
+            this.pointers,
+            this.getEffectiveModifiers(),
+            false,
+          );
         }, SHIFT_HOLD_DELAY_MS);
       }
 
@@ -479,7 +718,7 @@ export class TouchGestureManager {
         this.longPressTimer = window.setTimeout(() => {
           this.longPressTimer = null;
           if (this.disposed) return;
-          if (this.boxSelectArmed) return;
+          if (this.boxSelectArmed || this.trackballState) return;
           if (
             this.pointers.size !== 1 ||
             this.peakCount !== 1 ||
@@ -543,6 +782,7 @@ export class TouchGestureManager {
       this.clearLongPressTimer();
       this.clearShiftHoldTimer();
       this.lastTap = null;
+      this.altTapCandidate = false;
       if (this.shiftHoldActive && !this.shiftSecondFingerUsed) {
         this.deactivateShiftHold(true);
       }
@@ -554,13 +794,92 @@ export class TouchGestureManager {
 
     this.callbacks.onTouchNavigationChange(
       this.pointers,
-      this.getModifierState(),
+      this.getEffectiveModifiers(e),
       this.isBoxSelectBlockingOrbit(),
     );
   };
 
   private handlePointerMove = (e: PointerEvent) => {
     if (this.disposed) return;
+
+    // Handle active / armed G modal Move/Slide drag exclusively
+    if (this.modalDragState && this.modalDragState.pointerId === e.pointerId) {
+      if (this.callbacks.isGizmoBusy() || !this.callbacks.isModalTransformArmed?.()) {
+        this.cancelModalDrag(true);
+        return;
+      }
+      const ptr = this.pointers.get(e.pointerId);
+      if (ptr) {
+        ptr.currX = e.clientX;
+        ptr.currY = e.clientY;
+      }
+      this.modalDragState.currX = e.clientX;
+      this.modalDragState.currY = e.clientY;
+      const dist = Math.hypot(
+        e.clientX - this.modalDragState.startX,
+        e.clientY - this.modalDragState.startY,
+      );
+      if (dist > this.maxMoveDist) {
+        this.maxMoveDist = dist;
+      }
+      if (!this.modalDragState.activeDrag) {
+        if (dist >= MODAL_DRAG_THRESHOLD_PX) {
+          this.modalDragState.activeDrag = true;
+          this.callbacks.onModalTransformStart?.(
+            this.modalDragState.startX,
+            this.modalDragState.startY,
+          );
+          this.callbacks.onModalTransformMove?.(e.clientX, e.clientY);
+        }
+      } else {
+        this.callbacks.onModalTransformMove?.(e.clientX, e.clientY);
+      }
+      return;
+    }
+
+    // Handle active / armed CTRL + drag Virtual Trackball rotation exclusively
+    if (this.trackballState && this.trackballState.pointerId === e.pointerId) {
+      const eff = this.getEffectiveModifiers(e);
+      if (this.callbacks.isGizmoBusy()) {
+        this.cancelTrackball(true);
+        return;
+      }
+      if (!eff.ctrl || eff.shift || eff.alt) {
+        if (this.trackballState.activeDrag && !eff.shift && !eff.alt) {
+          this.finishTrackball(true);
+        } else {
+          this.cancelTrackball(true);
+        }
+        return;
+      }
+      const ptr = this.pointers.get(e.pointerId);
+      if (ptr) {
+        ptr.currX = e.clientX;
+        ptr.currY = e.clientY;
+      }
+      this.trackballState.currX = e.clientX;
+      this.trackballState.currY = e.clientY;
+      const dist = Math.hypot(
+        e.clientX - this.trackballState.startX,
+        e.clientY - this.trackballState.startY,
+      );
+      if (dist > this.maxMoveDist) {
+        this.maxMoveDist = dist;
+      }
+      if (!this.trackballState.activeDrag) {
+        if (dist >= TRACKBALL_DRAG_THRESHOLD_PX) {
+          this.trackballState.activeDrag = true;
+          this.callbacks.onTrackballRotateStart?.(
+            this.trackballState.startX,
+            this.trackballState.startY,
+          );
+          this.callbacks.onTrackballRotateMove?.(e.clientX, e.clientY);
+        }
+      } else {
+        this.callbacks.onTrackballRotateMove?.(e.clientX, e.clientY);
+      }
+      return;
+    }
 
     // Handle active / armed double-tap + drag box selection exclusively
     if (this.boxSelectArmed && this.boxSelectArmed.pointerId === e.pointerId) {
@@ -587,14 +906,14 @@ export class TouchGestureManager {
         if (dist >= BOX_SELECT_DRAG_THRESHOLD_PX) {
           this.boxSelectArmed.activeDrag = true;
           const rect = this.buildBoxRect(this.boxSelectArmed);
-          const modifiers = this.getPointerModifierState(e);
+          const modifiers = this.getEffectiveModifiers(e);
           this.callbacks.onBoxSelectStart?.(rect, modifiers, e.shiftKey);
           this.callbacks.onBoxSelectMove?.(rect, modifiers, e.shiftKey);
         }
       } else {
         this.callbacks.onBoxSelectMove?.(
           this.buildBoxRect(this.boxSelectArmed),
-          this.getPointerModifierState(e),
+          this.getEffectiveModifiers(e),
           e.shiftKey,
         );
       }
@@ -653,6 +972,47 @@ export class TouchGestureManager {
   private handlePointerUp = (e: PointerEvent) => {
     if (this.disposed) return;
 
+    // Handle G modal Move/Slide release (confirm on finger lift!)
+    if (this.modalDragState && this.modalDragState.pointerId === e.pointerId) {
+      const state = this.modalDragState;
+      this.modalDragState = null;
+      this.releaseCaptureSafely(e.pointerId);
+      this.pointers.delete(e.pointerId);
+
+      if (state.activeDrag) {
+        this.callbacks.onModalTransformEnd?.();
+      }
+      this.lastTap = null;
+      this.resetEpisode();
+      this.callbacks.onTouchNavigationChange(
+        this.pointers,
+        this.getEffectiveModifiers(e),
+        false,
+      );
+      return;
+    }
+
+    // Handle CTRL + drag Virtual Trackball release
+    if (this.trackballState && this.trackballState.pointerId === e.pointerId) {
+      const state = this.trackballState;
+      this.trackballState = null;
+      this.releaseCaptureSafely(e.pointerId);
+      this.pointers.delete(e.pointerId);
+
+      if (state.activeDrag) {
+        this.callbacks.onTrackballRotateEnd?.();
+      }
+      // Static CTRL tap intentionally performs no rotation and no accidental deselection
+      this.lastTap = null;
+      this.resetEpisode();
+      this.callbacks.onTouchNavigationChange(
+        this.pointers,
+        this.getEffectiveModifiers(e),
+        false,
+      );
+      return;
+    }
+
     // Handle Double-Tap + Hold & Drag Box Selection release
     if (this.boxSelectArmed && this.boxSelectArmed.pointerId === e.pointerId) {
       const state = this.boxSelectArmed;
@@ -662,7 +1022,7 @@ export class TouchGestureManager {
       this.releaseCaptureSafely(e.pointerId);
       this.pointers.delete(e.pointerId);
 
-      const modifiers = this.getPointerModifierState(e);
+      const modifiers = this.getEffectiveModifiers(e);
       const dt = performance.now() - state.downTime;
       const moved = Math.hypot(
         state.currX - state.startX,
@@ -702,7 +1062,7 @@ export class TouchGestureManager {
       this.resetEpisode();
       this.callbacks.onTouchNavigationChange(
         this.pointers,
-        this.getModifierState(),
+        this.getEffectiveModifiers(e),
         false,
       );
       return;
@@ -712,7 +1072,7 @@ export class TouchGestureManager {
     if (!ptr) {
       this.callbacks.onTouchNavigationChange(
         this.pointers,
-        this.getModifierState(),
+        this.getEffectiveModifiers(e),
         this.isBoxSelectBlockingOrbit(),
       );
       return;
@@ -749,14 +1109,14 @@ export class TouchGestureManager {
           e.clientX,
           e.clientY,
           e.pointerType,
-          this.getPointerModifierState(e),
+          this.getEffectiveModifiers(e),
           e.shiftKey,
         );
       }
 
       this.callbacks.onTouchNavigationChange(
         this.pointers,
-        this.getModifierState(),
+        this.getEffectiveModifiers(e),
         this.isBoxSelectBlockingOrbit(),
       );
       if (this.pointers.size === 0) {
@@ -784,11 +1144,8 @@ export class TouchGestureManager {
     if (this.pointers.size === 0) {
       const now = performance.now();
       const dt = now - this.episodeStartTime;
-      this.callbacks.onTouchNavigationChange(
-        this.pointers,
-        this.getModifierState(),
-        false,
-      );
+      const effMods = this.getEffectiveModifiers(e);
+      this.callbacks.onTouchNavigationChange(this.pointers, effMods, false);
 
       const usedModifierFlow =
         this.shiftHoldWasActivated || this.shiftSecondFingerUsed;
@@ -804,32 +1161,47 @@ export class TouchGestureManager {
             e.pointerType === 'touch'
               ? SINGLE_TAP_MOVE_TOUCH_PX
               : SINGLE_TAP_MOVE_MOUSE_PX;
-          const tapEnabled =
-            e.pointerType !== 'touch' || this.config.oneFingerTapSelect;
 
           if (
+            this.altTapCandidate &&
             isValidButton &&
-            tapEnabled &&
             this.maxMoveDist <= moveLimit &&
             dt <= SINGLE_TAP_MAX_MS
           ) {
+            // ALT + tap toggles Object Mode / Edit Mode once per gesture
             this.episodeInvalidated = true;
-            // Record tap for potential Double-Tap + Hold & Drag on next rapid press
-            this.lastTap = {
-              time: now,
-              x: e.clientX,
-              y: e.clientY,
-              pointerType: e.pointerType,
-            };
-            this.callbacks.onSingleTap(
-              e.clientX,
-              e.clientY,
-              e.pointerType,
-              this.getPointerModifierState(e),
-              e.shiftKey,
-            );
-          } else {
             this.lastTap = null;
+            this.callbacks.onAltTap?.();
+          } else {
+            const tapEnabled =
+              e.pointerType !== 'touch' || this.config.oneFingerTapSelect;
+
+            if (
+              isValidButton &&
+              tapEnabled &&
+              this.maxMoveDist <= moveLimit &&
+              dt <= SINGLE_TAP_MAX_MS &&
+              !effMods.ctrl &&
+              !effMods.alt
+            ) {
+              this.episodeInvalidated = true;
+              // Record tap for potential Double-Tap + Hold & Drag on next rapid press
+              this.lastTap = {
+                time: now,
+                x: e.clientX,
+                y: e.clientY,
+                pointerType: e.pointerType,
+              };
+              this.callbacks.onSingleTap(
+                e.clientX,
+                e.clientY,
+                e.pointerType,
+                effMods,
+                e.shiftKey,
+              );
+            } else {
+              this.lastTap = null;
+            }
           }
         } else if (this.peakCount === 2) {
           this.lastTap = null;
@@ -860,7 +1232,7 @@ export class TouchGestureManager {
     } else {
       this.callbacks.onTouchNavigationChange(
         this.pointers,
-        this.getModifierState(),
+        this.getEffectiveModifiers(e),
         this.isBoxSelectBlockingOrbit(),
       );
     }
@@ -868,6 +1240,22 @@ export class TouchGestureManager {
 
   private handlePointerCancel = (e: PointerEvent) => {
     if (this.disposed) return;
+
+    if (this.modalDragState && this.modalDragState.pointerId === e.pointerId) {
+      this.pointers.delete(e.pointerId);
+      this.cancelModalDrag(true);
+      this.lastTap = null;
+      this.resetEpisode();
+      return;
+    }
+
+    if (this.trackballState && this.trackballState.pointerId === e.pointerId) {
+      this.pointers.delete(e.pointerId);
+      this.cancelTrackball(true);
+      this.lastTap = null;
+      this.resetEpisode();
+      return;
+    }
 
     if (this.boxSelectArmed && this.boxSelectArmed.pointerId === e.pointerId) {
       this.pointers.delete(e.pointerId);
@@ -893,7 +1281,7 @@ export class TouchGestureManager {
     this.episodeInvalidated = true;
     this.callbacks.onTouchNavigationChange(
       this.pointers,
-      this.getModifierState(),
+      this.getEffectiveModifiers(e),
       this.isBoxSelectBlockingOrbit(),
     );
     if (this.pointers.size === 0) {
@@ -905,6 +1293,14 @@ export class TouchGestureManager {
     this.disposed = true;
     this.clearLongPressTimer();
     this.clearShiftHoldTimer();
+    if (this.modalDragState) {
+      this.releaseCaptureSafely(this.modalDragState.pointerId);
+      this.modalDragState = null;
+    }
+    if (this.trackballState) {
+      this.releaseCaptureSafely(this.trackballState.pointerId);
+      this.trackballState = null;
+    }
     if (this.boxSelectArmed) {
       this.releaseCaptureSafely(this.boxSelectArmed.pointerId);
       this.boxSelectArmed = null;
@@ -916,5 +1312,6 @@ export class TouchGestureManager {
     this.element.removeEventListener('pointercancel', this.handlePointerCancel);
     this.element.removeEventListener('contextmenu', this.handleContextMenu);
     window.removeEventListener('blur', this.handleWindowBlur);
+    document.removeEventListener('visibilitychange', this.handleVisibilityChange);
   }
 }

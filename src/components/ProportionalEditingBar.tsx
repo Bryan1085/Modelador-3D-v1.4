@@ -22,6 +22,7 @@ interface ProportionalEditingBarProps {
   onToggleConnectedOnly: () => void;
   onChangeFalloff: (falloff: ProportionalFalloff) => void;
   onChangeRadius: (radius: number) => void;
+  children?: React.ReactNode;
 }
 
 const FalloffCurveSvg: React.FC<{
@@ -92,6 +93,7 @@ export const ProportionalEditingBar: React.FC<ProportionalEditingBarProps> = ({
   onToggleConnectedOnly,
   onChangeFalloff,
   onChangeRadius,
+  children,
 }) => {
   const [showFalloffMenu, setShowFalloffMenu] = useState(false);
   const [radiusInput, setRadiusInput] = useState(() =>
@@ -328,6 +330,7 @@ export const ProportionalEditingBar: React.FC<ProportionalEditingBarProps> = ({
           <span>{modifierWarning}</span>
         </div>
       )}
+      {children}
     </div>
   );
 };

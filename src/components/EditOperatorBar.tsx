@@ -5,8 +5,10 @@ import {
   FlipHorizontal,
   GitMerge,
   Grid,
+  Link2,
   Minimize2,
   Scissors,
+  ScissorsLineDashed,
   Square,
   X,
 } from 'lucide-react';
@@ -21,11 +23,14 @@ import {
 interface EditOperatorBarProps {
   session: EditOperatorSession;
   mergedCount?: number;
+  operatorError?: string | null;
+  operatorStatusMessage?: string | null;
   loopCutFaceCount?: number;
   loopCutIsClosed?: boolean;
   loopCutError?: string | null;
   loopCutSlideActive?: boolean;
   onToggleLoopCutSlideActive?: () => void;
+  onSwitchMergeOperator?: (target: 'merge' | 'merge_by_distance') => void;
   onUpdateConfig: (config: EditOperatorParams) => void;
   onConfirm: () => void;
   onCancel: () => void;
@@ -63,16 +68,27 @@ const OPERATOR_META: Record<
     title: 'Fusionar por Distancia',
     icon: <Minimize2 className="w-4 h-4 text-[#ff9900]" />,
   },
+  dissolve_limited: {
+    title: 'Limited Dissolve',
+    icon: <ScissorsLineDashed className="w-4 h-4 text-[#38bdf8]" />,
+  },
+  bridge_loops: {
+    title: 'Bridge Edge Loops',
+    icon: <Link2 className="w-4 h-4 text-[#38bdf8]" />,
+  },
 };
 
 export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
   session,
   mergedCount = 0,
+  operatorError = null,
+  operatorStatusMessage = null,
   loopCutFaceCount = 0,
   loopCutIsClosed = false,
   loopCutError = null,
   loopCutSlideActive = false,
   onToggleLoopCutSlideActive,
+  onSwitchMergeOperator,
   onUpdateConfig,
   onConfirm,
   onCancel,
@@ -81,6 +97,7 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
   const meta = OPERATOR_META[config.type];
   const isLoopCutMissingEdge =
     config.type === 'loop_cut' && !config.params.edgeId;
+  const isConfirmDisabled = isLoopCutMissingEdge || Boolean(operatorError);
 
   const renderNumberControl = (
     label: string,
@@ -183,6 +200,17 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
               {mergedCount} vértice{mergedCount === 1 ? '' : 's'} a fusionar
             </span>
           )}
+          {config.type === 'dissolve_limited' && operatorStatusMessage && (
+            <span className="px-2 py-0.5 rounded bg-[#202631] border border-[#38bdf8]/40 text-[11px] text-[#7dd3fc] truncate">
+              {operatorStatusMessage}
+            </span>
+          )}
+          {config.type === 'bridge_loops' && !operatorError && (
+            <span className="px-2 py-0.5 rounded bg-[#202631] border border-[#38bdf8]/40 text-[11px] font-mono-tabular text-[#7dd3fc] whitespace-nowrap">
+              {mergedCount} cara{mergedCount === 1 ? '' : 's'} nueva
+              {mergedCount === 1 ? '' : 's'}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
@@ -197,7 +225,7 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
           <button
             type="button"
             onClick={onConfirm}
-            disabled={isLoopCutMissingEdge}
+            disabled={isConfirmDisabled}
             className="min-h-[38px] px-3.5 rounded-md bg-[#ff9900] hover:bg-[#ffa726] disabled:opacity-40 disabled:cursor-not-allowed text-xs font-bold text-[#111215] flex items-center gap-1.5 transition-colors"
           >
             <Check className="w-3.5 h-3.5" />
@@ -206,9 +234,9 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
         </div>
       </div>
 
-      {config.type === 'loop_cut' && loopCutError && (
+      {((config.type === 'loop_cut' && loopCutError) || operatorError) && (
         <div className="px-2.5 py-1.5 rounded bg-[#2c191c] border border-[#e06c75]/50 text-[11px] text-[#fca5a5]">
-          {loopCutError}
+          {config.type === 'loop_cut' ? loopCutError : operatorError}
         </div>
       )}
 
@@ -560,7 +588,7 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
                   { id: 'center', label: 'Al centro' },
                   { id: 'first', label: 'Al primero' },
                   { id: 'last', label: 'Al último' },
-                  { id: 'cursor', label: 'Coordenada' },
+                  { id: 'cursor', label: 'Cursor 3D' },
                 ] as { id: MergeMode; label: string }[]
               ).map((opt) => (
                 <button
@@ -581,10 +609,19 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
                   {opt.label}
                 </button>
               ))}
+              {onSwitchMergeOperator && (
+                <button
+                  type="button"
+                  onClick={() => onSwitchMergeOperator('merge_by_distance')}
+                  className="h-8 px-2.5 rounded text-xs font-semibold border bg-[#20232b] text-[#b4bac4] border-[#2f333d] hover:text-white transition-colors"
+                >
+                  Por distancia
+                </button>
+              )}
             </div>
 
             {config.params.mode === 'cursor' && (
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 {(['X', 'Y', 'Z'] as const).map((axisLabel, idx) => {
                   const pos = config.params.cursorPosition ?? [0, 0, 0];
                   return (
@@ -615,6 +652,21 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
                     </label>
                   );
                 })}
+                <button
+                  type="button"
+                  onClick={() =>
+                    onUpdateConfig({
+                      type: 'merge',
+                      params: {
+                        ...config.params,
+                        cursorPosition: [0, 0, 0],
+                      },
+                    })
+                  }
+                  className="h-8 px-2 rounded bg-[#20232b] hover:bg-[#2c313b] border border-[#2f333d] text-[11px] text-[#b4bac4] hover:text-white"
+                >
+                  Origen
+                </button>
               </div>
             )}
           </>
@@ -723,6 +775,173 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
                 </button>
               </div>
             )}
+
+            {onSwitchMergeOperator && (
+              <button
+                type="button"
+                onClick={() => onSwitchMergeOperator('merge')}
+                className="h-8 px-2.5 rounded text-xs font-semibold border bg-[#20232b] text-[#b4bac4] border-[#2f333d] hover:text-white transition-colors"
+              >
+                Centro / Cursor
+              </button>
+            )}
+          </>
+        )}
+
+        {config.type === 'dissolve_limited' && (
+          <>
+            {renderNumberControl(
+              'Ángulo máx (°)',
+              config.params.maxAngleDeg,
+              0.5,
+              180,
+              0.5,
+              (maxAngleDeg) =>
+                onUpdateConfig({
+                  type: 'dissolve_limited',
+                  params: { ...config.params, maxAngleDeg },
+                }),
+            )}
+
+            <div className="flex items-center gap-1">
+              {[1, 5, 15, 45].map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() =>
+                    onUpdateConfig({
+                      type: 'dissolve_limited',
+                      params: { ...config.params, maxAngleDeg: preset },
+                    })
+                  }
+                  className={`h-8 px-2 rounded text-[11px] font-mono-tabular border transition-colors ${
+                    Math.abs(config.params.maxAngleDeg - preset) < 0.1
+                      ? 'bg-[#202a36] text-[#38bdf8] border-[#38bdf8]/60'
+                      : 'bg-[#20232b] text-[#a1a7b3] border-[#2f333d] hover:text-white'
+                  }`}
+                >
+                  {preset}°
+                </button>
+              ))}
+            </div>
+
+            <button
+              type="button"
+              onClick={() =>
+                onUpdateConfig({
+                  type: 'dissolve_limited',
+                  params: {
+                    ...config.params,
+                    dissolveVertices: !config.params.dissolveVertices,
+                  },
+                })
+              }
+              className={`h-8 px-2.5 rounded text-xs font-medium border transition-colors ${
+                config.params.dissolveVertices
+                  ? 'bg-[#202a36] text-[#38bdf8] border-[#38bdf8]/60'
+                  : 'bg-[#20232b] text-[#a1a7b3] border-[#2f333d] hover:text-white'
+              }`}
+            >
+              Limpiar vértices colineales
+            </button>
+
+            {baseSelectedIds.length > 0 && (
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() =>
+                    onUpdateConfig({
+                      type: 'dissolve_limited',
+                      params: { ...config.params, scope: 'selection' },
+                    })
+                  }
+                  className={`h-8 px-2.5 rounded text-xs font-medium border transition-colors ${
+                    config.params.scope === 'selection'
+                      ? 'bg-[#202a36] text-[#38bdf8] border-[#38bdf8]/60'
+                      : 'bg-[#20232b] text-[#a1a7b3] border-[#2f333d] hover:text-white'
+                  }`}
+                >
+                  Solo selección
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onUpdateConfig({
+                      type: 'dissolve_limited',
+                      params: { ...config.params, scope: 'all' },
+                    })
+                  }
+                  className={`h-8 px-2.5 rounded text-xs font-medium border transition-colors ${
+                    config.params.scope === 'all'
+                      ? 'bg-[#202a36] text-[#38bdf8] border-[#38bdf8]/60'
+                      : 'bg-[#20232b] text-[#a1a7b3] border-[#2f333d] hover:text-white'
+                  }`}
+                >
+                  Toda la malla
+                </button>
+              </div>
+            )}
+          </>
+        )}
+
+        {config.type === 'bridge_loops' && (
+          <>
+            {renderStepper(
+              'Segmentos',
+              config.params.segments,
+              1,
+              16,
+              (segments) =>
+                onUpdateConfig({
+                  type: 'bridge_loops',
+                  params: { ...config.params, segments },
+                }),
+            )}
+
+            {renderNumberControl(
+              'Suavizado',
+              config.params.smoothness,
+              0,
+              1,
+              0.05,
+              (smoothness) =>
+                onUpdateConfig({
+                  type: 'bridge_loops',
+                  params: { ...config.params, smoothness },
+                }),
+            )}
+
+            {renderStepper(
+              'Giro',
+              config.params.twistOffset,
+              -16,
+              16,
+              (twistOffset) =>
+                onUpdateConfig({
+                  type: 'bridge_loops',
+                  params: { ...config.params, twistOffset },
+                }),
+            )}
+
+            <button
+              type="button"
+              onClick={() =>
+                onUpdateConfig({
+                  type: 'bridge_loops',
+                  params: {
+                    ...config.params,
+                    reverseOrder: !config.params.reverseOrder,
+                  },
+                })
+              }
+              className={`h-8 px-2.5 rounded text-xs font-medium border transition-colors ${
+                config.params.reverseOrder
+                  ? 'bg-[#202a36] text-[#38bdf8] border-[#38bdf8]/60'
+                  : 'bg-[#20232b] text-[#a1a7b3] border-[#2f333d] hover:text-white'
+              }`}
+            >
+              Invertir orden
+            </button>
           </>
         )}
       </div>

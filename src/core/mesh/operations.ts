@@ -200,3 +200,205 @@ export function computeDerivedEditSelection(
   return { vertexIds, edgeIds, faceIds };
 }
 
+/**
+ * Bakes an object transform (position, rotation Euler XYZ, scale) into local mesh vertex coordinates.
+ * Reverses face winding if scale has an odd number of negative axes so normals remain outward.
+ */
+export function applyObjectTransformToMesh(
+  mesh: EditableMesh,
+  transform: { position: Vec3; rotation: Vec3; scale: Vec3 },
+): EditableMesh {
+  const next = mesh.clone();
+  const pos = new THREE.Vector3(...transform.position);
+  const quat = new THREE.Quaternion().setFromEuler(
+    new THREE.Euler(transform.rotation[0], transform.rotation[1], transform.rotation[2], 'XYZ'),
+  );
+  const scl = new THREE.Vector3(...transform.scale);
+  const mat = new THREE.Matrix4().compose(pos, quat, scl);
+
+  for (const v of next.vertices) {
+    _v.set(v.position[0], v.position[1], v.position[2]).applyMatrix4(mat);
+    v.position = [_v.x, _v.y, _v.z];
+  }
+
+  const detScale = transform.scale[0] * transform.scale[1] * transform.scale[2];
+  if (detScale < 0) {
+    for (const f of next.faces) {
+      f.vertexIds.reverse();
+      if (f.uvs) f.uvs.reverse();
+    }
+  }
+
+  next.clearCustomNormals();
+  next.rebuildIndices();
+  return next;
+}
+
+/**
+ * Centers local mesh vertices around their bounding-box center and returns the local center offset
+ * so the caller can compensate object position in world space without moving the visible geometry.
+ */
+export function centerMeshOrigin(
+  mesh: EditableMesh,
+): { mesh: EditableMesh; localOffset: Vec3 } | null {
+  if (mesh.vertices.length === 0) return null;
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let minZ = Infinity;
+  let maxZ = -Infinity;
+
+  for (const v of mesh.vertices) {
+    if (v.position[0] < minX) minX = v.position[0];
+    if (v.position[0] > maxX) maxX = v.position[0];
+    if (v.position[1] < minY) minY = v.position[1];
+    if (v.position[1] > maxY) maxY = v.position[1];
+    if (v.position[2] < minZ) minZ = v.position[2];
+    if (v.position[2] > maxZ) maxZ = v.position[2];
+  }
+
+  const cx = (minX + maxX) * 0.5;
+  const cy = (minY + maxY) * 0.5;
+  const cz = (minZ + maxZ) * 0.5;
+
+  const next = mesh.clone();
+  for (const v of next.vertices) {
+    v.position = [v.position[0] - cx, v.position[1] - cy, v.position[2] - cz];
+  }
+  next.clearCustomNormals();
+  next.rebuildIndices();
+  return { mesh: next, localOffset: [cx, cy, cz] };
+}
+
+export interface SeparateGeometryResult {
+  remainingMesh?: EditableMesh;
+  separatedMesh?: EditableMesh;
+  error?: string;
+}
+
+/**
+ * Separates currently selected geometry (faces, or edges/vertices on wire meshes)
+ * into a standalone EditableMesh while preserving manifold topology on the source mesh.
+ */
+export function separateGeometryFromMesh(
+  sourceMesh: EditableMesh,
+  mode: EditSelectionMode,
+  selectedIds: ReadonlySet<string>,
+): SeparateGeometryResult {
+  if (selectedIds.size === 0) {
+    return { error: 'Selecciona la geometría que deseas separar' };
+  }
+
+  const derived = computeDerivedEditSelection(sourceMesh, mode, selectedIds);
+
+  if (sourceMesh.faces.length > 0) {
+    if (derived.faceIds.size === 0) {
+      return {
+        error: 'Selecciona al menos una cara (o todos los vértices de una cara) para separar',
+      };
+    }
+    if (derived.faceIds.size >= sourceMesh.faces.length) {
+      return {
+        error: 'No se puede separar toda la geometría del objeto activo',
+      };
+    }
+
+    const separated = new EditableMesh();
+    const vertMap = new Map<string, string>();
+    const touchedFaceVerts = new Set<string>();
+    const candidateEdgeIds = new Set<string>();
+
+    for (const fid of derived.faceIds) {
+      const face = sourceMesh.getFace(fid);
+      if (!face) continue;
+      for (const eid of sourceMesh.getEdgesForFace(fid)) {
+        candidateEdgeIds.add(eid);
+      }
+      const newFaceVerts: string[] = [];
+      for (const vid of face.vertexIds) {
+        touchedFaceVerts.add(vid);
+        let mappedId = vertMap.get(vid);
+        if (!mappedId) {
+          const origV = sourceMesh.getVertex(vid);
+          if (!origV) continue;
+          const addedV = separated.addVertex(
+            origV.position[0],
+            origV.position[1],
+            origV.position[2],
+          );
+          if (origV.uv) addedV.uv = [origV.uv[0], origV.uv[1]];
+          mappedId = addedV.id;
+          vertMap.set(vid, mappedId);
+        }
+        newFaceVerts.push(mappedId);
+      }
+      const createdFace = separated.addFace(newFaceVerts);
+      if (createdFace && face.uvs) {
+        createdFace.uvs = face.uvs.map((uv) => [uv[0], uv[1]]);
+      }
+    }
+    separated.clearCustomNormals();
+    separated.rebuildIndices();
+
+    const remaining = sourceMesh.clone();
+    remaining.deleteFaces(derived.faceIds);
+
+    const edgesToDelete = new Set<string>();
+    for (const eid of candidateEdgeIds) {
+      if (remaining.getFacesForEdge(eid).length === 0) {
+        edgesToDelete.add(eid);
+      }
+    }
+    if (edgesToDelete.size > 0) {
+      remaining.deleteEdges(edgesToDelete);
+    }
+    remaining.pruneOrphanVertices(touchedFaceVerts);
+    remaining.clearCustomNormals();
+    remaining.rebuildIndices();
+
+    return { remainingMesh: remaining, separatedMesh: separated };
+  }
+
+  // Wireframe / edge-only mesh fallback (e.g. Circle primitive)
+  if (derived.vertexIds.size === 0) {
+    return { error: 'Selecciona vértices o aristas para separar' };
+  }
+  if (derived.vertexIds.size >= sourceMesh.vertices.length) {
+    return { error: 'No se puede separar toda la geometría del objeto activo' };
+  }
+
+  const separated = new EditableMesh();
+  const vertMap = new Map<string, string>();
+  for (const vid of derived.vertexIds) {
+    const v = sourceMesh.getVertex(vid);
+    if (!v) continue;
+    const added = separated.addVertex(v.position[0], v.position[1], v.position[2]);
+    vertMap.set(vid, added.id);
+  }
+  const edgesToRemove = new Set<string>();
+  for (const edge of sourceMesh.edges) {
+    if (derived.vertexIds.has(edge.v0) && derived.vertexIds.has(edge.v1)) {
+      const nv0 = vertMap.get(edge.v0);
+      const nv1 = vertMap.get(edge.v1);
+      if (nv0 && nv1) {
+        separated.addEdge(nv0, nv1);
+        edgesToRemove.add(edge.id);
+      }
+    }
+  }
+  separated.rebuildIndices();
+
+  const remaining = sourceMesh.clone();
+  if (edgesToRemove.size > 0) {
+    remaining.deleteEdges(edgesToRemove);
+    remaining.pruneOrphanVertices(derived.vertexIds);
+  } else {
+    remaining.deleteVertices(derived.vertexIds);
+  }
+  remaining.rebuildIndices();
+
+  return { remainingMesh: remaining, separatedMesh: separated };
+}
+

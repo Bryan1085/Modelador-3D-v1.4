@@ -20,6 +20,7 @@ import {
   RefreshCw,
   RotateCw,
   Scissors,
+  ScissorsLineDashed,
   SlidersHorizontal,
   Square,
   Trash2,
@@ -27,7 +28,10 @@ import {
   Waypoints,
   X,
 } from 'lucide-react';
-import { DeleteActionType } from '../core/mesh/advancedOperations';
+import {
+  DeleteActionType,
+  EdgeSelectionTool,
+} from '../core/mesh/advancedOperations';
 import { EditSelectionMode } from '../core/mesh/operations';
 import { PrimitiveOptions, PrimitiveType } from '../core/mesh/primitives';
 import {
@@ -57,6 +61,7 @@ interface FloatingRadialMenuProps {
   containerRef: React.RefObject<HTMLDivElement | null>;
   workMode: WorkMode;
   editSelectionMode: EditSelectionMode;
+  edgeSelectionTool?: EdgeSelectionTool;
   activeTool: TransformTool;
   activeOperatorType?: EditOperatorType | null;
   axisConstraint: AxisConstraint;
@@ -92,6 +97,8 @@ interface FloatingRadialMenuProps {
   onToggleProjection: () => void;
   onToggleWorkMode: (mode: WorkMode) => void;
   onChangeEditSelectionMode: (mode: EditSelectionMode) => void;
+  onChangeEdgeSelectionTool?: (tool: EdgeSelectionTool) => void;
+  onSelectEdgeTopology?: (kind: 'loop' | 'ring') => void;
   onToggleXray: () => void;
   onToggleFaceOrientation: () => void;
   onToggleGrid: () => void;
@@ -134,6 +141,7 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
   containerRef,
   workMode,
   editSelectionMode,
+  edgeSelectionTool = 'single',
   activeTool,
   activeOperatorType = null,
   axisConstraint,
@@ -165,6 +173,8 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
   onToggleProjection,
   onToggleWorkMode,
   onChangeEditSelectionMode,
+  onChangeEdgeSelectionTool,
+  onSelectEdgeTopology,
   onToggleXray,
   onToggleFaceOrientation,
   onToggleGrid,
@@ -360,6 +370,8 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
       case 'add_circle':
       case 'add_uv_sphere':
       case 'add_cylinder':
+      case 'add_cone':
+      case 'add_torus':
       case 'add_pyramid':
       case 'add_suzanne':
         disabled = workMode !== 'object';
@@ -407,7 +419,15 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
       case 'op_loop_cut':
       case 'op_merge':
       case 'op_merge_by_distance':
+      case 'op_bridge_loops':
       case 'fill_mesh':
+        disabled = workMode !== 'edit' || !hasSelectedComponents;
+        break;
+      case 'op_dissolve_limited':
+        disabled = workMode !== 'edit';
+        break;
+      case 'select_edge_loop':
+      case 'select_edge_ring':
         disabled = workMode !== 'edit' || !hasSelectedComponents;
         break;
       case 'connect_vertex_path':
@@ -602,6 +622,14 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
         onAddPrimitive('cylinder');
         closeAll();
         break;
+      case 'add_cone':
+        onAddPrimitive('cone');
+        closeAll();
+        break;
+      case 'add_torus':
+        onAddPrimitive('torus');
+        closeAll();
+        break;
       case 'add_pyramid':
         onAddPrimitive('pyramid');
         closeAll();
@@ -652,6 +680,22 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
         break;
       case 'op_merge_by_distance':
         onStartOperator('merge_by_distance');
+        closeAll();
+        break;
+      case 'op_bridge_loops':
+        onStartOperator('bridge_loops');
+        closeAll();
+        break;
+      case 'op_dissolve_limited':
+        onStartOperator('dissolve_limited');
+        closeAll();
+        break;
+      case 'select_edge_loop':
+        onSelectEdgeTopology?.('loop');
+        closeAll();
+        break;
+      case 'select_edge_ring':
+        onSelectEdgeTopology?.('ring');
         closeAll();
         break;
       case 'duplicate_object':
@@ -864,6 +908,8 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
     { id: 'loop_cut', label: 'Bucle', icon: <Scissors className="w-3.5 h-3.5" /> },
     { id: 'merge', label: 'Fusionar', icon: <GitMerge className="w-3.5 h-3.5" /> },
     { id: 'merge_by_distance', label: 'Dist.', icon: <Minimize2 className="w-3.5 h-3.5" /> },
+    { id: 'bridge_loops', label: 'Bridge', icon: <Link2 className="w-3.5 h-3.5" /> },
+    { id: 'dissolve_limited', label: 'Lim. Diss.', icon: <ScissorsLineDashed className="w-3.5 h-3.5" /> },
   ];
 
   return (
@@ -1205,6 +1251,31 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
                     ))}
                   </div>
 
+                  {editSelectionMode === 'edge' && onChangeEdgeSelectionTool && (
+                    <div className="flex items-center p-0.5 rounded-lg bg-[#111317] border border-[#2c303a]">
+                      {(
+                        [
+                          { id: 'single', label: 'Arista' },
+                          { id: 'loop', label: 'Bucle' },
+                          { id: 'ring', label: 'Anillo' },
+                        ] as const
+                      ).map((toolOpt) => (
+                        <button
+                          key={toolOpt.id}
+                          type="button"
+                          onClick={() => onChangeEdgeSelectionTool(toolOpt.id)}
+                          className={`h-8 px-2 rounded-md text-[11px] font-semibold transition-colors touch-manipulation ${
+                            edgeSelectionTool === toolOpt.id
+                              ? 'bg-[#1a2c3d] text-[#38bdf8]'
+                              : 'text-[#9ca3af] hover:text-white'
+                          }`}
+                        >
+                          {toolOpt.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
                   <div className="flex items-center gap-1">
                     <button
                       type="button"
@@ -1429,6 +1500,10 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
                 editSelectionMode={editSelectionMode}
                 onSelectAction={(action) => {
                   onExecuteContextualDelete(action);
+                  closeAll();
+                }}
+                onLimitedDissolve={() => {
+                  onStartOperator('dissolve_limited');
                   closeAll();
                 }}
                 onClose={() => setShowDeletePicker(false)}

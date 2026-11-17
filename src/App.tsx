@@ -428,6 +428,11 @@ export default function App() {
         store.cancelEditOperator();
         return;
       }
+      if (e.key === 'Escape' && store.modalTransform) {
+        e.preventDefault();
+        store.cancelModalTransform();
+        return;
+      }
       if (e.key === 'Enter' && store.operatorSession) {
         e.preventDefault();
         store.confirmEditOperator();
@@ -444,7 +449,7 @@ export default function App() {
           }
           break;
         case 'g':
-          if (!ctrlHeld && !altHeld) store.setActiveTool('move');
+          if (!ctrlHeld && !altHeld) store.triggerGQuickTapMove();
           break;
         case 'r':
           if (!ctrlHeld && !altHeld) store.setActiveTool('rotate');
@@ -716,6 +721,7 @@ export default function App() {
           selectedObjectIds={store.selectedObjectIds}
           workMode={store.workMode}
           editSelectionMode={store.editSelectionMode}
+          edgeSelectionTool={store.edgeSelectionTool}
           selectedComponentIds={store.selectedComponentIds}
           activeTool={store.activeTool}
           axisConstraint={store.axisConstraint}
@@ -727,6 +733,8 @@ export default function App() {
           screenModifiers={store.screenModifiers}
           operatorSession={store.operatorSession}
           operatorMergedCount={store.operatorMergedCount}
+          operatorError={store.operatorError}
+          operatorStatusMessage={store.operatorStatusMessage}
           loopCutPreviewSegments={store.loopCutPreviewSegments}
           loopCutRingEdgeIds={store.loopCutRingEdgeIds}
           loopCutFaceIds={store.loopCutFaceIds}
@@ -775,13 +783,19 @@ export default function App() {
             store.setActiveTool(tool);
           }}
           onDuplicateObject={store.duplicateSelectedObject}
+          onApplyObjectTransform={store.applyObjectTransform}
+          onCenterObjectOrigin={store.centerObjectOrigin}
+          onSeparateSelectedGeometry={store.separateSelectedGeometry}
           onHideObject={store.toggleObjectVisibility}
           onDeleteObject={store.deleteSelectedObjects}
           onToggleWorkMode={store.toggleWorkMode}
           onChangeEditSelectionMode={store.changeEditSelectionMode}
+          onChangeEdgeSelectionTool={store.setEdgeSelectionTool}
+          onSelectEdgeTopology={store.selectEdgeTopology}
           onSelectAll={store.selectAllEditComponents}
           onDeselectAll={store.deselectAllEditComponents}
           onStartOperator={store.startEditOperator}
+          onSwitchMergeOperator={store.switchMergeOperator}
           onFillSelection={store.executeFillSelection}
           onConnectVertexPath={store.executeConnectVertexPath}
           onRecalculateOutside={store.executeRecalculateOutside}
@@ -795,6 +809,13 @@ export default function App() {
           onChangeProportionalRadius={store.setProportionalRadius}
           onSaveProject={store.saveProject}
           onOpenSettings={() => setShowSettingsModal(true)}
+          modalTransform={store.modalTransform}
+          modalCancelNonce={store.modalCancelNonce}
+          onGQuickTapMove={store.triggerGQuickTapMove}
+          onGHoldSlide={store.triggerGHoldSlide}
+          onChangeModalClamp={store.setModalTransformClamp}
+          onCancelModalTransform={store.cancelModalTransform}
+          onCompleteModalTransform={store.completeModalTransform}
         />
 
         {/* D. Panel Lateral Desplegable (Jerarquía y Modificadores) */}

@@ -40,6 +40,8 @@ export type RadialActionId =
   | 'mode_vertex'
   | 'mode_edge'
   | 'mode_face'
+  | 'select_edge_loop'
+  | 'select_edge_ring'
   | 'toggle_multi_select'
   | 'toggle_shift_modifier'
   // 3. Transformación
@@ -60,6 +62,8 @@ export type RadialActionId =
   | 'add_circle'
   | 'add_uv_sphere'
   | 'add_cylinder'
+  | 'add_cone'
+  | 'add_torus'
   | 'add_pyramid'
   | 'add_suzanne'
   | 'fill_mesh'
@@ -71,6 +75,7 @@ export type RadialActionId =
   | 'op_loop_cut'
   | 'op_merge'
   | 'op_merge_by_distance'
+  | 'op_bridge_loops'
   | 'connect_vertex_path'
   | 'op_recalculate_normals'
   | 'op_flip_normals'
@@ -78,6 +83,7 @@ export type RadialActionId =
   // 6. Eliminación
   | 'delete_contextual'
   | 'dissolve_quick'
+  | 'op_dissolve_limited'
   | 'delete_edges_verts'
   | 'delete_faces_edges'
   // 7. Historial
@@ -104,6 +110,8 @@ export type RadialIconKey =
   | 'vertex'
   | 'edge'
   | 'face'
+  | 'edge_loop'
+  | 'edge_ring'
   | 'multi_select'
   | 'shift'
   | 'pointer'
@@ -122,6 +130,8 @@ export type RadialIconKey =
   | 'circle'
   | 'sphere'
   | 'cylinder'
+  | 'cone'
+  | 'torus'
   | 'pyramid'
   | 'suzanne'
   | 'fill'
@@ -132,6 +142,7 @@ export type RadialIconKey =
   | 'loop_cut'
   | 'merge'
   | 'merge_dist'
+  | 'bridge'
   | 'connect_path'
   | 'recalculate_normals'
   | 'flip_normals'
@@ -261,6 +272,24 @@ export const RADIAL_ACTION_LIBRARY: RadialActionDefinition[] = [
     description: 'Cambia el submodo de Edición a Caras',
     category: 'selection',
     icon: 'face',
+    supportedModes: ['edit'],
+  },
+  {
+    id: 'select_edge_loop',
+    label: 'Seleccionar Bucle (Edge Loop)',
+    shortLabel: 'Bucle',
+    description: 'Selecciona el bucle continuo de aristas a partir de la arista activa',
+    category: 'selection',
+    icon: 'edge_loop',
+    supportedModes: ['edit'],
+  },
+  {
+    id: 'select_edge_ring',
+    label: 'Seleccionar Anillo (Edge Ring)',
+    shortLabel: 'Anillo',
+    description: 'Selecciona las aristas paralelas del anillo de quads',
+    category: 'selection',
+    icon: 'edge_ring',
     supportedModes: ['edit'],
   },
   {
@@ -433,6 +462,24 @@ export const RADIAL_ACTION_LIBRARY: RadialActionDefinition[] = [
     supportedModes: ['object'],
   },
   {
+    id: 'add_cone',
+    label: 'Agregar Cono',
+    shortLabel: 'Cono',
+    description: 'Inserta un cono editable en la escena',
+    category: 'creation',
+    icon: 'cone',
+    supportedModes: ['object'],
+  },
+  {
+    id: 'add_torus',
+    label: 'Agregar Toroide',
+    shortLabel: 'Toroide',
+    description: 'Inserta un toroide editable en la escena',
+    category: 'creation',
+    icon: 'torus',
+    supportedModes: ['object'],
+  },
+  {
     id: 'add_pyramid',
     label: 'Agregar Pirámide',
     shortLabel: 'Pirámide',
@@ -526,6 +573,15 @@ export const RADIAL_ACTION_LIBRARY: RadialActionDefinition[] = [
     supportedModes: ['edit'],
   },
   {
+    id: 'op_bridge_loops',
+    label: 'Bridge Edge Loops',
+    shortLabel: 'Bridge',
+    description: 'Conecta dos contornos abiertos con segmentos y suavizado ajustables',
+    category: 'modification',
+    icon: 'bridge',
+    supportedModes: ['edit'],
+  },
+  {
     id: 'connect_vertex_path',
     label: 'Connect Vertex Path (J)',
     shortLabel: 'Conectar (J)',
@@ -584,6 +640,15 @@ export const RADIAL_ACTION_LIBRARY: RadialActionDefinition[] = [
     category: 'deletion',
     icon: 'dissolve',
     danger: true,
+    supportedModes: ['edit'],
+  },
+  {
+    id: 'op_dissolve_limited',
+    label: 'Limited Dissolve',
+    shortLabel: 'Lim. Diss.',
+    description: 'Simplifica aristas planas y vértices colineales según el ángulo configurado',
+    category: 'deletion',
+    icon: 'dissolve',
     supportedModes: ['edit'],
   },
   {

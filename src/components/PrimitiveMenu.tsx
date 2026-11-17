@@ -2,12 +2,14 @@ import React, { useState } from 'react';
 import {
   Box,
   Circle,
+  Cone,
   Cylinder,
   Globe,
   Minus,
   Plus,
   Pyramid,
   Square,
+  Torus,
   X,
 } from 'lucide-react';
 import { PrimitiveOptions, PrimitiveType } from '../core/mesh/primitives';
@@ -238,6 +240,36 @@ export const PrimitiveMenu: React.FC<PrimitiveMenuProps> = ({
             </div>
           </div>
         </div>
+
+        {/* Cono */}
+        <button
+          type="button"
+          onClick={() => handleAdd('cone')}
+          className="w-full min-h-[48px] px-3 py-2 rounded-md bg-[#262a31] hover:bg-[#2f343d] active:bg-[#383e48] border border-transparent hover:border-[#ff9900]/40 flex items-center gap-3 text-left transition-colors"
+        >
+          <Cone className="w-5 h-5 text-[#ff9900] shrink-0" />
+          <div className="min-w-0">
+            <div className="text-xs font-semibold text-[#f3f4f6]">Cono</div>
+            <div className="text-[11px] text-[#9ca3af] font-mono-tabular">
+              16 segmentos · base circular
+            </div>
+          </div>
+        </button>
+
+        {/* Toroide */}
+        <button
+          type="button"
+          onClick={() => handleAdd('torus')}
+          className="w-full min-h-[48px] px-3 py-2 rounded-md bg-[#262a31] hover:bg-[#2f343d] active:bg-[#383e48] border border-transparent hover:border-[#ff9900]/40 flex items-center gap-3 text-left transition-colors"
+        >
+          <Torus className="w-5 h-5 text-[#ff9900] shrink-0" />
+          <div className="min-w-0">
+            <div className="text-xs font-semibold text-[#f3f4f6]">Toroide</div>
+            <div className="text-[11px] text-[#9ca3af] font-mono-tabular">
+              24 × 12 segmentos · anillo 3D
+            </div>
+          </div>
+        </button>
 
         {/* Pirámide */}
         <button

@@ -7,6 +7,8 @@ export type PrimitiveType =
   | 'circle'
   | 'uv_sphere'
   | 'cylinder'
+  | 'cone'
+  | 'torus'
   | 'pyramid'
   | 'suzanne';
 
@@ -24,6 +26,8 @@ export const PRIMITIVE_LABELS: Record<PrimitiveType, string> = {
   circle: 'Círculo',
   uv_sphere: 'Esfera UV',
   cylinder: 'Cilindro',
+  cone: 'Cono',
+  torus: 'Toroide',
   pyramid: 'Pirámide',
   suzanne: 'Suzanne',
 };
@@ -192,6 +196,89 @@ export function createCylinderMesh(
   // Bottom cap (-Z normal)
   mesh.addFace([...bottomRing].reverse());
 
+  return mesh;
+}
+
+/**
+ * Cono: eje de altura vertical en Z, base circular paralela al plano XY y vértice superior en +Z.
+ */
+export function createConeMesh(
+  radius = 1,
+  height = 2,
+  segments = 16,
+): EditableMesh {
+  const mesh = new EditableMesh();
+  const segs = Math.max(3, Math.min(64, Math.round(segments)));
+  const halfH = height / 2;
+
+  const baseRing: string[] = [];
+  for (let s = 0; s < segs; s++) {
+    const theta = (s / segs) * Math.PI * 2;
+    const x = Math.cos(theta) * radius;
+    const y = Math.sin(theta) * radius;
+    baseRing.push(mesh.addVertex(x, y, -halfH).id);
+  }
+  const apex = mesh.addVertex(0, 0, halfH).id;
+
+  // Side triangular faces (CCW outward)
+  for (let s = 0; s < segs; s++) {
+    const nextS = (s + 1) % segs;
+    mesh.addFace([baseRing[s], baseRing[nextS], apex]);
+  }
+
+  // Bottom cap (-Z normal)
+  mesh.addFace([...baseRing].reverse());
+
+  mesh.rebuildIndices();
+  return mesh;
+}
+
+/**
+ * Toroide: anillo mayor en plano XY (eje de simetría Z).
+ */
+export function createTorusMesh(
+  majorRadius = 1,
+  minorRadius = 0.35,
+  majorSegments = 24,
+  minorSegments = 12,
+): EditableMesh {
+  const mesh = new EditableMesh();
+  const majSegs = Math.max(6, Math.min(64, Math.round(majorSegments)));
+  const minSegs = Math.max(4, Math.min(48, Math.round(minorSegments)));
+
+  const grid: string[][] = [];
+  for (let i = 0; i < majSegs; i++) {
+    const u = (i / majSegs) * Math.PI * 2;
+    const cosU = Math.cos(u);
+    const sinU = Math.sin(u);
+    const ring: string[] = [];
+    for (let j = 0; j < minSegs; j++) {
+      const v = (j / minSegs) * Math.PI * 2;
+      const cosV = Math.cos(v);
+      const sinV = Math.sin(v);
+      const ringR = majorRadius + minorRadius * cosV;
+      ring.push(
+        mesh.addVertex(ringR * cosU, ringR * sinU, minorRadius * sinV).id,
+      );
+    }
+    grid.push(ring);
+  }
+
+  // Quad faces with outward CCW winding
+  for (let i = 0; i < majSegs; i++) {
+    const nextI = (i + 1) % majSegs;
+    for (let j = 0; j < minSegs; j++) {
+      const nextJ = (j + 1) % minSegs;
+      mesh.addFace([
+        grid[i][j],
+        grid[nextI][j],
+        grid[nextI][nextJ],
+        grid[i][nextJ],
+      ]);
+    }
+  }
+
+  mesh.rebuildIndices();
   return mesh;
 }
 
@@ -494,6 +581,19 @@ export function createPrimitiveMesh(
         options.radius ?? 1,
         options.height ?? 2,
         options.segments ?? 16,
+      );
+    case 'cone':
+      return createConeMesh(
+        options.radius ?? 1,
+        options.height ?? 2,
+        options.segments ?? 16,
+      );
+    case 'torus':
+      return createTorusMesh(
+        options.radius ?? 1,
+        0.35,
+        options.segments ?? 24,
+        options.rings ?? 12,
       );
     case 'pyramid':
       return createPyramidMesh(options.size ?? 2, options.height ?? 2);

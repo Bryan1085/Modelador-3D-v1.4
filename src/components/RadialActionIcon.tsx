@@ -11,12 +11,14 @@ import {
   CircleDot,
   Columns,
   Compass,
+  Cone,
   Copy,
   CopyPlus,
   Cylinder,
   Eye,
   FlipHorizontal,
   Focus,
+  GitCommitHorizontal,
   GitMerge,
   Globe,
   Grid,
@@ -39,6 +41,7 @@ import {
   Settings,
   Square,
   SquareDashed,
+  Torus,
   Trash2,
   Triangle,
   Undo2,
@@ -79,6 +82,10 @@ export const RadialActionIcon: React.FC<RadialActionIconProps> = ({
       return <Minus className={className} />;
     case 'face':
       return <Square className={className} />;
+    case 'edge_loop':
+      return <GitCommitHorizontal className={className} />;
+    case 'edge_ring':
+      return <Columns className={className} />;
     case 'multi_select':
       return <CopyPlus className={className} />;
     case 'shift':
@@ -141,6 +148,10 @@ export const RadialActionIcon: React.FC<RadialActionIconProps> = ({
       return <Globe className={className} />;
     case 'cylinder':
       return <Cylinder className={className} />;
+    case 'cone':
+      return <Cone className={className} />;
+    case 'torus':
+      return <Torus className={className} />;
     case 'pyramid':
       return <Pyramid className={className} />;
     case 'suzanne':
@@ -178,6 +189,8 @@ export const RadialActionIcon: React.FC<RadialActionIconProps> = ({
       return <GitMerge className={className} />;
     case 'merge_dist':
       return <Minimize2 className={className} />;
+    case 'bridge':
+      return <Link2 className={className} />;
     case 'connect_path':
       return <Waypoints className={className} />;
     case 'recalculate_normals':

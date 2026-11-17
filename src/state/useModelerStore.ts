@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import * as THREE from 'three';
 import { EditableMesh, Vec3 } from '../core/mesh/EditableMesh';
 import {
+  applyObjectTransformToMesh,
+  centerMeshOrigin,
   computeDerivedEditSelection,
   deleteSelectedComponents,
   EditSelectionMode,
   selectAllComponents,
+  separateGeometryFromMesh,
 } from '../core/mesh/operations';
 import {
   createPrimitiveMesh,
@@ -34,24 +38,33 @@ import {
   saveSettingsLocally,
 } from '../core/project/storage';
 import {
+  analyzeBridgeEdgeLoops,
   analyzeEdgeLoopRing,
   applyDeleteAction,
   bevelMesh,
   BevelParams,
+  bridgeEdgeLoopsMesh,
+  BridgeEdgeLoopsParams,
+  buildEdgeSlidePlan,
+  buildVertexSlidePlan,
   computeLoopCutPreviewSegments,
   DeleteActionType,
+  EdgeSelectionTool,
   extrudeMesh,
   ExtrudeParams,
   fillMesh,
   findFirstValidLoopEdge,
   insetFacesMesh,
   InsetParams,
+  limitedDissolveMesh,
+  LimitedDissolveParams,
   loopCutMesh,
   LoopCutParams,
   mergeByDistanceMesh,
   MergeByDistanceParams,
   mergeVerticesMesh,
   MergeParams,
+  resolveEdgeLoopSelection,
   subdivideMesh,
   SubdivideParams,
 } from '../core/mesh/advancedOperations';
@@ -166,7 +179,9 @@ export type EditOperatorType =
   | 'bevel'
   | 'loop_cut'
   | 'merge'
-  | 'merge_by_distance';
+  | 'merge_by_distance'
+  | 'dissolve_limited'
+  | 'bridge_loops';
 
 export type EditOperatorParams =
   | { type: 'extrude'; params: ExtrudeParams }
@@ -175,7 +190,9 @@ export type EditOperatorParams =
   | { type: 'bevel'; params: BevelParams }
   | { type: 'loop_cut'; params: LoopCutParams }
   | { type: 'merge'; params: MergeParams }
-  | { type: 'merge_by_distance'; params: MergeByDistanceParams };
+  | { type: 'merge_by_distance'; params: MergeByDistanceParams }
+  | { type: 'dissolve_limited'; params: LimitedDissolveParams }
+  | { type: 'bridge_loops'; params: BridgeEdgeLoopsParams };
 
 export interface EditOperatorSession {
   objectId: string;
@@ -183,6 +200,13 @@ export interface EditOperatorSession {
   baseSelectionMode: EditSelectionMode;
   baseSelectedIds: string[];
   config: EditOperatorParams;
+}
+
+export type ModalGMode = 'move' | 'vertex_slide' | 'edge_slide';
+
+export interface ModalTransformState {
+  mode: ModalGMode;
+  clamp: boolean;
 }
 
 interface HistorySnapshot {
@@ -220,6 +244,9 @@ export function useModelerStore() {
   const [workMode, setWorkMode] = useState<WorkMode>('object');
   const [editSelectionMode, setEditSelectionMode] =
     useState<EditSelectionMode>('vertex');
+  const [edgeSelectionTool, setEdgeSelectionTool] =
+    useState<EdgeSelectionTool>('single');
+  const [cursor3D, setCursor3D] = useState<Vec3>([0, 0, 0]);
   const [selectedComponentIds, setSelectedComponentIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -265,17 +292,34 @@ export function useModelerStore() {
   const setActiveTool = useCallback(
     (tool: TransformTool) => {
       setActiveToolState(tool);
+      if (tool !== 'move') {
+        setModalTransform(null);
+      }
       releaseScreenModifiers();
     },
     [releaseScreenModifiers],
   );
   const [operatorSession, setOperatorSession] =
     useState<EditOperatorSession | null>(null);
+  const [modalTransform, setModalTransform] =
+    useState<ModalTransformState | null>(null);
+  const [modalCancelNonce, setModalCancelNonce] = useState(0);
   const [loopCutPickError, setLoopCutPickError] = useState<string | null>(null);
 
   const undoStackRef = useRef<HistorySnapshot[]>([]);
   const redoStackRef = useRef<HistorySnapshot[]>([]);
   const [historyVersion, setHistoryVersion] = useState(0);
+  const savedEditSelectionsRef = useRef<
+    Map<string, { mode: EditSelectionMode; ids: string[] }>
+  >(new Map());
+
+  const saveCurrentEditSelection = useCallback(() => {
+    if (workMode !== 'edit' || !selectedObjectId) return;
+    savedEditSelectionsRef.current.set(selectedObjectId, {
+      mode: editSelectionMode,
+      ids: Array.from(selectedComponentIds),
+    });
+  }, [editSelectionMode, selectedComponentIds, selectedObjectId, workMode]);
 
   const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
@@ -372,6 +416,8 @@ export function useModelerStore() {
         return;
       }
       setOperatorSession(null);
+      setModalTransform(null);
+      setModalCancelNonce((n) => n + 1);
       redoStackRef.current.push(makeSnapshot());
       setProject((p) => ({
         ...p,
@@ -405,6 +451,8 @@ export function useModelerStore() {
         return;
       }
       setOperatorSession(null);
+      setModalTransform(null);
+      setModalCancelNonce((n) => n + 1);
       undoStackRef.current.push(makeSnapshot());
       setProject((p) => ({
         ...p,
@@ -469,6 +517,7 @@ export function useModelerStore() {
       const fresh = saveProjectLocally(createNewProject(name.trim() || 'Nuevo Proyecto'));
       undoStackRef.current = [];
       redoStackRef.current = [];
+      savedEditSelectionsRef.current.clear();
       setProject(fresh);
       setSavedProjects(listSavedProjects());
       setSingleSelectedObject(getActiveScene(fresh).objects[0]?.id ?? null);
@@ -495,6 +544,7 @@ export function useModelerStore() {
       setOperatorSession(null);
       undoStackRef.current = [];
       redoStackRef.current = [];
+      savedEditSelectionsRef.current.clear();
       setProject(loaded);
       setSingleSelectedObject(getActiveScene(loaded).objects[0]?.id ?? null);
       setWorkMode('object');
@@ -591,6 +641,7 @@ export function useModelerStore() {
       const effectiveAdditive = additive || screenShiftActive;
       setOperatorSession(null);
       if (workMode === 'edit' && id !== selectedObjectId) {
+        saveCurrentEditSelection();
         setWorkMode('object');
         setSelectedComponentIds(new Set());
         releaseScreenModifiers();
@@ -618,6 +669,7 @@ export function useModelerStore() {
     },
     [
       releaseScreenModifiers,
+      saveCurrentEditSelection,
       screenShiftActive,
       selectedObjectId,
       selectedObjectIds,
@@ -644,6 +696,7 @@ export function useModelerStore() {
       }
 
       if (workMode === 'edit' && nextPrimary !== selectedObjectId) {
+        saveCurrentEditSelection();
         setWorkMode('object');
         setSelectedComponentIds(new Set());
         releaseScreenModifiers();
@@ -653,6 +706,7 @@ export function useModelerStore() {
     },
     [
       releaseScreenModifiers,
+      saveCurrentEditSelection,
       screenShiftActive,
       selectedObjectId,
       selectedObjectIds,
@@ -664,6 +718,7 @@ export function useModelerStore() {
     (sceneId: string, objectId: string, additive = false) => {
       setOperatorSession(null);
       if (sceneId !== project.activeSceneId) {
+        saveCurrentEditSelection();
         setProject((p) => switchSceneInProject(p, sceneId));
         setWorkMode('object');
         releaseScreenModifiers();
@@ -677,6 +732,7 @@ export function useModelerStore() {
     [
       project.activeSceneId,
       releaseScreenModifiers,
+      saveCurrentEditSelection,
       selectObject,
       setSingleSelectedObject,
     ],
@@ -685,6 +741,8 @@ export function useModelerStore() {
   const toggleWorkMode = useCallback(
     (nextMode: WorkMode) => {
       setOperatorSession(null);
+      setModalTransform(null);
+      setModalCancelNonce((n) => n + 1);
       releaseScreenModifiers();
       if (nextMode === 'edit') {
         if (!selectedObject) {
@@ -703,18 +761,49 @@ export function useModelerStore() {
           showToast('El objeto está bloqueado');
           return;
         }
-        setSelectedComponentIds(new Set());
+        // Keep active object as primary selection and restore previous edit selection if still valid
+        setSingleSelectedObject(selectedObject.id);
+        const saved = savedEditSelectionsRef.current.get(selectedObject.id);
+        if (saved && saved.ids.length > 0) {
+          const mesh = EditableMesh.fromJSON(selectedObject.mesh);
+          const validIds = new Set<string>();
+          for (const id of saved.ids) {
+            const exists =
+              saved.mode === 'vertex'
+                ? Boolean(mesh.getVertex(id))
+                : saved.mode === 'edge'
+                  ? Boolean(mesh.getEdge(id))
+                  : Boolean(mesh.getFace(id));
+            if (exists) validIds.add(id);
+          }
+          setEditSelectionMode(saved.mode);
+          setSelectedComponentIds(validIds);
+        } else {
+          setSelectedComponentIds(new Set());
+        }
       } else {
+        saveCurrentEditSelection();
         setSelectedComponentIds(new Set());
+        if (selectedObject) {
+          setSingleSelectedObject(selectedObject.id);
+        }
       }
       setWorkMode(nextMode);
     },
-    [releaseScreenModifiers, selectedObject, showToast],
+    [
+      releaseScreenModifiers,
+      saveCurrentEditSelection,
+      selectedObject,
+      setSingleSelectedObject,
+      showToast,
+    ],
   );
 
   const changeEditSelectionMode = useCallback(
     (mode: EditSelectionMode) => {
       setOperatorSession(null);
+      setModalTransform(null);
+      setModalCancelNonce((n) => n + 1);
       if (mode === editSelectionMode) return;
       if (selectedObject && selectedComponentIds.size > 0) {
         const mesh = EditableMesh.fromJSON(selectedObject.mesh);
@@ -924,13 +1013,21 @@ export function useModelerStore() {
         })),
       }));
       if (objectId === selectedObjectId && workMode === 'edit') {
+        saveCurrentEditSelection();
         setWorkMode('object');
-        setScreenShiftActive(false);
+        releaseScreenModifiers();
         setSelectedComponentIds(new Set());
       }
       setHasUnsavedChanges(true);
     },
-    [makeSnapshot, pushHistory, selectedObjectId, workMode],
+    [
+      makeSnapshot,
+      pushHistory,
+      releaseScreenModifiers,
+      saveCurrentEditSelection,
+      selectedObjectId,
+      workMode,
+    ],
   );
 
   const duplicateObjectById = useCallback(
@@ -964,20 +1061,231 @@ export function useModelerStore() {
           s.id === targetScene.id ? { ...s, objects: [...s.objects, copy] } : s,
         ),
       }));
+      saveCurrentEditSelection();
       setSingleSelectedObject(copy.id);
       setWorkMode('object');
-      setScreenShiftActive(false);
+      releaseScreenModifiers();
+      setSelectedComponentIds(new Set());
       setHasUnsavedChanges(true);
       setMeshRevision((r) => r + 1);
       showToast(`Objeto duplicado: ${copy.name}`);
     },
-    [makeSnapshot, project.scenes, pushHistory, setSingleSelectedObject, showToast],
+    [
+      makeSnapshot,
+      project.scenes,
+      pushHistory,
+      releaseScreenModifiers,
+      saveCurrentEditSelection,
+      setSingleSelectedObject,
+      showToast,
+    ],
   );
 
   const duplicateSelectedObject = useCallback(() => {
     if (!selectedObject) return;
     duplicateObjectById(selectedObject.id);
   }, [duplicateObjectById, selectedObject]);
+
+  const applyObjectTransform = useCallback(() => {
+    if (!selectedObject) {
+      showToast('Selecciona un objeto para aplicar transformaciones');
+      return;
+    }
+    if (!isEditableMeshObject(selectedObject)) {
+      showToast('Este tipo de objeto no permite aplicar transformaciones a la malla');
+      return;
+    }
+    if (selectedObject.locked) {
+      showToast('Desbloquea el objeto antes de aplicar transformaciones');
+      return;
+    }
+    setOperatorSession(null);
+    pushHistory(makeSnapshot());
+
+    const baked = applyObjectTransformToMesh(
+      EditableMesh.fromJSON(selectedObject.mesh),
+      selectedObject.transform,
+    );
+    const bakedJson = baked.toJSON();
+    const identityTransform: ObjectTransform = {
+      position: [0, 0, 0],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+    };
+
+    setProject((p) =>
+      updateActiveScene(p, (scene) => ({
+        ...scene,
+        objects: scene.objects.map((o) =>
+          o.id === selectedObject.id
+            ? { ...o, mesh: bakedJson, transform: identityTransform }
+            : o,
+        ),
+      })),
+    );
+    releaseScreenModifiers();
+    setHasUnsavedChanges(true);
+    setMeshRevision((r) => r + 1);
+    showToast(`Transformaciones aplicadas a "${selectedObject.name}"`);
+  }, [
+    makeSnapshot,
+    pushHistory,
+    releaseScreenModifiers,
+    selectedObject,
+    showToast,
+  ]);
+
+  const centerObjectOrigin = useCallback(() => {
+    if (!selectedObject) {
+      showToast('Selecciona un objeto para centrar su origen');
+      return;
+    }
+    if (!isEditableMeshObject(selectedObject)) {
+      showToast('Este tipo de objeto no permite centrar su origen geométrico');
+      return;
+    }
+    if (selectedObject.locked) {
+      showToast('Desbloquea el objeto antes de centrar su origen');
+      return;
+    }
+    const baseMesh = EditableMesh.fromJSON(selectedObject.mesh);
+    const res = centerMeshOrigin(baseMesh);
+    if (!res) {
+      showToast('El objeto no tiene vértices para centrar el origen');
+      return;
+    }
+    setOperatorSession(null);
+    pushHistory(makeSnapshot());
+
+    const quat = new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(
+        selectedObject.transform.rotation[0],
+        selectedObject.transform.rotation[1],
+        selectedObject.transform.rotation[2],
+        'XYZ',
+      ),
+    );
+    const worldOffset = new THREE.Vector3(
+      res.localOffset[0] * selectedObject.transform.scale[0],
+      res.localOffset[1] * selectedObject.transform.scale[1],
+      res.localOffset[2] * selectedObject.transform.scale[2],
+    ).applyQuaternion(quat);
+
+    const nextPos: Vec3 = [
+      selectedObject.transform.position[0] + worldOffset.x,
+      selectedObject.transform.position[1] + worldOffset.y,
+      selectedObject.transform.position[2] + worldOffset.z,
+    ];
+    const centeredJson = res.mesh.toJSON();
+
+    setProject((p) =>
+      updateActiveScene(p, (scene) => ({
+        ...scene,
+        objects: scene.objects.map((o) =>
+          o.id === selectedObject.id
+            ? {
+                ...o,
+                mesh: centeredJson,
+                transform: { ...o.transform, position: nextPos },
+              }
+            : o,
+        ),
+      })),
+    );
+    releaseScreenModifiers();
+    setHasUnsavedChanges(true);
+    setMeshRevision((r) => r + 1);
+    showToast(`Origen centrado en "${selectedObject.name}"`);
+  }, [
+    makeSnapshot,
+    pushHistory,
+    releaseScreenModifiers,
+    selectedObject,
+    showToast,
+  ]);
+
+  const separateSelectedGeometry = useCallback(() => {
+    if (!selectedObject || workMode !== 'edit') {
+      showToast('Entra en Modo Edición y selecciona geometría para separar');
+      return;
+    }
+    if (!isEditableMeshObject(selectedObject)) {
+      showToast('Este objeto no admite separación de geometría');
+      return;
+    }
+    if (selectedObject.locked) {
+      showToast('El objeto está bloqueado');
+      return;
+    }
+
+    const sourceMesh = EditableMesh.fromJSON(selectedObject.mesh);
+    const sepRes = separateGeometryFromMesh(
+      sourceMesh,
+      editSelectionMode,
+      selectedComponentIds,
+    );
+    if (sepRes.error || !sepRes.remainingMesh || !sepRes.separatedMesh) {
+      showToast(sepRes.error ?? 'No se pudo separar la geometría seleccionada');
+      return;
+    }
+
+    setOperatorSession(null);
+    pushHistory(makeSnapshot());
+
+    const baseName = `${selectedObject.name} Parte`;
+    const existingCount = activeObjects.filter((o) =>
+      o.name.startsWith(baseName),
+    ).length;
+    const newName =
+      existingCount === 0 ? baseName : `${baseName} ${existingCount + 1}`;
+
+    const newObj: SceneObjectData = {
+      id: generateId('obj'),
+      name: newName,
+      objectType: 'mesh',
+      primitiveType: 'custom',
+      collectionId: selectedObject.collectionId,
+      visible: true,
+      locked: false,
+      transform: {
+        position: [...selectedObject.transform.position] as Vec3,
+        rotation: [...selectedObject.transform.rotation] as Vec3,
+        scale: [...selectedObject.transform.scale] as Vec3,
+      },
+      mesh: sepRes.separatedMesh.toJSON(),
+      material: { ...selectedObject.material },
+      modifiers: [],
+    };
+
+    const remainingJson = sepRes.remainingMesh.toJSON();
+    setProject((p) =>
+      updateActiveScene(p, (scene) => ({
+        ...scene,
+        objects: [
+          ...scene.objects.map((o) =>
+            o.id === selectedObject.id ? { ...o, mesh: remainingJson } : o,
+          ),
+          newObj,
+        ],
+      })),
+    );
+    savedEditSelectionsRef.current.delete(selectedObject.id);
+    setSelectedComponentIds(new Set());
+    releaseScreenModifiers();
+    setHasUnsavedChanges(true);
+    setMeshRevision((r) => r + 1);
+    showToast(`Geometría separada en "${newName}"`);
+  }, [
+    activeObjects,
+    editSelectionMode,
+    makeSnapshot,
+    pushHistory,
+    releaseScreenModifiers,
+    selectedComponentIds,
+    selectedObject,
+    showToast,
+    workMode,
+  ]);
 
   const deleteObject = useCallback(
     (objectId: string) => {
@@ -992,6 +1300,7 @@ export function useModelerStore() {
         return;
       }
       pushHistory(makeSnapshot());
+      savedEditSelectionsRef.current.delete(objectId);
       const remaining = targetScene.objects.filter((o) => o.id !== objectId);
       setProject((p) => ({
         ...p,
@@ -1050,6 +1359,9 @@ export function useModelerStore() {
     }
 
     pushHistory(makeSnapshot());
+    for (const uid of unlockedIds) {
+      savedEditSelectionsRef.current.delete(uid);
+    }
     const remaining = activeObjects.filter((o) => !unlockedIds.has(o.id));
     setProject((p) =>
       updateActiveScene(p, (scene) => ({
@@ -1231,8 +1543,11 @@ export function useModelerStore() {
         const nextActiveScene = getActiveScene(res.project);
         setSelectedObjectId(nextActiveScene.objects[0]?.id ?? null);
         setWorkMode('object');
-        setScreenShiftActive(false);
+        releaseScreenModifiers();
         setSelectedComponentIds(new Set());
+      }
+      for (const did of res.deletedObjectIds) {
+        savedEditSelectionsRef.current.delete(did);
       }
       setHasUnsavedChanges(true);
       setMeshRevision((r) => r + 1);
@@ -1242,7 +1557,14 @@ export function useModelerStore() {
           : 'Colección eliminada',
       );
     },
-    [makeSnapshot, project, pushHistory, selectedObjectId, showToast],
+    [
+      makeSnapshot,
+      project,
+      pushHistory,
+      releaseScreenModifiers,
+      selectedObjectId,
+      showToast,
+    ],
   );
 
   const moveObjectToCollection = useCallback(
@@ -1462,7 +1784,7 @@ export function useModelerStore() {
       setOperatorSession(null);
       setSingleSelectedObject(refObj.id);
       setWorkMode('object');
-      setScreenShiftActive(false);
+      releaseScreenModifiers();
       setSelectedComponentIds(new Set());
       setHasUnsavedChanges(true);
       setMeshRevision((r) => r + 1);
@@ -1474,6 +1796,7 @@ export function useModelerStore() {
       activeScene.collections,
       makeSnapshot,
       pushHistory,
+      releaseScreenModifiers,
       setSingleSelectedObject,
       showToast,
     ],
@@ -1576,11 +1899,119 @@ export function useModelerStore() {
     (id: string | null, additive: boolean, addOnly = false) => {
       if (operatorSession) return;
       const effectiveAdditive = additive || screenShiftActive;
+      if (
+        workMode === 'edit' &&
+        editSelectionMode === 'edge' &&
+        edgeSelectionTool !== 'single' &&
+        id !== null &&
+        !addOnly &&
+        selectedObject
+      ) {
+        const mesh = EditableMesh.fromJSON(selectedObject.mesh);
+        const loopRes = resolveEdgeLoopSelection(mesh, id, edgeSelectionTool);
+        if (!loopRes.valid || loopRes.edgeIds.length < 2) {
+          showToast(
+            loopRes.reason ??
+              'Esta arista no pertenece a un bucle o anillo válido.',
+          );
+          return;
+        }
+        setSelectedComponentIds((prev) => {
+          const allAlreadySelected = loopRes.edgeIds.every((eid) =>
+            prev.has(eid),
+          );
+          if (effectiveAdditive) {
+            const next = new Set(prev);
+            if (allAlreadySelected) {
+              for (const eid of loopRes.edgeIds) next.delete(eid);
+            } else {
+              for (const eid of loopRes.edgeIds) next.add(eid);
+            }
+            return next;
+          }
+          if (allAlreadySelected && prev.size === loopRes.edgeIds.length) {
+            return new Set();
+          }
+          return new Set(loopRes.edgeIds);
+        });
+        return;
+      }
       setSelectedComponentIds((prev) =>
         applyComponentSelection(prev, id, effectiveAdditive, addOnly),
       );
     },
-    [operatorSession, screenShiftActive],
+    [
+      edgeSelectionTool,
+      editSelectionMode,
+      operatorSession,
+      screenShiftActive,
+      selectedObject,
+      showToast,
+      workMode,
+    ],
+  );
+
+  const selectEdgeTopology = useCallback(
+    (kind: 'loop' | 'ring', targetEdgeId?: string) => {
+      if (!selectedObject || workMode !== 'edit') return;
+      if (operatorSession) return;
+      const mesh = EditableMesh.fromJSON(selectedObject.mesh);
+      let seedEdgeId = targetEdgeId ?? null;
+      if (!seedEdgeId || !mesh.getEdge(seedEdgeId)) {
+        if (editSelectionMode === 'edge') {
+          for (const id of selectedComponentIds) {
+            if (mesh.getEdge(id)) {
+              seedEdgeId = id;
+              break;
+            }
+          }
+        } else {
+          const derived = computeDerivedEditSelection(
+            mesh,
+            editSelectionMode,
+            selectedComponentIds,
+          );
+          seedEdgeId = derived.edgeIds.values().next().value ?? null;
+        }
+      }
+      if (!seedEdgeId) {
+        showToast('Selecciona o toca una arista primero.');
+        return;
+      }
+      const res = resolveEdgeLoopSelection(mesh, seedEdgeId, kind);
+      if (!res.valid || res.edgeIds.length < 2) {
+        showToast(
+          res.reason ??
+            (kind === 'ring'
+              ? 'La arista no pertenece a un Edge Ring cuadrangular válido.'
+              : 'La arista no pertenece a un Edge Loop válido.'),
+        );
+        return;
+      }
+      if (editSelectionMode !== 'edge') {
+        setEditSelectionMode('edge');
+      }
+      setSelectedComponentIds((prev) => {
+        const base =
+          editSelectionMode === 'edge' && screenShiftActive
+            ? new Set(prev)
+            : new Set<string>();
+        for (const eid of res.edgeIds) base.add(eid);
+        return base;
+      });
+      showToast(
+        `${kind === 'ring' ? 'Anillo' : 'Bucle'}${res.isClosed ? ' cerrado' : ' abierto'}: ${res.edgeIds.length} aristas`,
+      );
+    },
+    [
+      editSelectionMode,
+      operatorSession,
+      screenShiftActive,
+      selectedComponentIds,
+      selectedObject,
+      showToast,
+      workMode,
+    ],
   );
 
   const selectComponentsFromBox = useCallback(
@@ -2209,6 +2640,7 @@ export function useModelerStore() {
           ),
         })),
       );
+      savedEditSelectionsRef.current.delete(objectId);
       if (workMode === 'edit' && selectedObjectId === objectId) {
         setSelectedComponentIds(new Set());
       }
@@ -2237,6 +2669,8 @@ export function useModelerStore() {
         showToast('El objeto está bloqueado');
         return;
       }
+      setModalTransform(null);
+      setModalCancelNonce((n) => n + 1);
       releaseScreenModifiers();
 
       const mesh = EditableMesh.fromJSON(selectedObject.mesh);
@@ -2301,6 +2735,59 @@ export function useModelerStore() {
             params: {
               distance: 0.005,
               scope: baseIds.length > 0 ? 'selection' : 'all',
+            },
+          },
+        });
+        return;
+      }
+
+      if (type === 'dissolve_limited') {
+        if (mesh.faces.length === 0) {
+          showToast('La malla necesita caras para aplicar Limited Dissolve');
+          return;
+        }
+        setOperatorSession({
+          objectId: selectedObject.id,
+          baseMesh: selectedObject.mesh,
+          baseSelectionMode: editSelectionMode,
+          baseSelectedIds: baseIds,
+          config: {
+            type: 'dissolve_limited',
+            params: {
+              maxAngleDeg: 5,
+              dissolveVertices: true,
+              scope: baseIds.length > 0 ? 'selection' : 'all',
+            },
+          },
+        });
+        return;
+      }
+
+      if (type === 'bridge_loops') {
+        const analysis = analyzeBridgeEdgeLoops(
+          mesh,
+          editSelectionMode,
+          selectedComponentIds,
+        );
+        if (!analysis.valid) {
+          showToast(
+            analysis.error ??
+              'Selecciona dos contornos abiertos compatibles para Bridge Edge Loops',
+          );
+          return;
+        }
+        setOperatorSession({
+          objectId: selectedObject.id,
+          baseMesh: selectedObject.mesh,
+          baseSelectionMode: editSelectionMode,
+          baseSelectedIds: baseIds,
+          config: {
+            type: 'bridge_loops',
+            params: {
+              segments: 1,
+              smoothness: 0,
+              twistOffset: 0,
+              reverseOrder: false,
             },
           },
         });
@@ -2382,7 +2869,6 @@ export function useModelerStore() {
           showToast('Selecciona al menos 2 vértices para fusionar');
           return;
         }
-        const centroid = mesh.computeCentroid(vertIds) ?? [0, 0, 0];
         setOperatorSession({
           objectId: selectedObject.id,
           baseMesh: selectedObject.mesh,
@@ -2390,12 +2876,16 @@ export function useModelerStore() {
           baseSelectedIds: baseIds,
           config: {
             type: 'merge',
-            params: { mode: 'center', cursorPosition: centroid },
+            params: {
+              mode: 'center',
+              cursorPosition: [...cursor3D] as Vec3,
+            },
           },
         });
       }
     },
     [
+      cursor3D,
       editSelectionMode,
       releaseScreenModifiers,
       selectedComponentIds,
@@ -2406,8 +2896,51 @@ export function useModelerStore() {
   );
 
   const updateOperatorConfig = useCallback((config: EditOperatorParams) => {
+    if (config.type === 'merge' && config.params.cursorPosition) {
+      setCursor3D([...config.params.cursorPosition] as Vec3);
+    }
     setOperatorSession((prev) => (prev ? { ...prev, config } : null));
   }, []);
+
+  const switchMergeOperator = useCallback(
+    (target: 'merge' | 'merge_by_distance') => {
+      setOperatorSession((prev) => {
+        if (!prev) return prev;
+        if (target === 'merge') {
+          const baseMesh = EditableMesh.fromJSON(prev.baseMesh);
+          const vertIds = baseMesh.getVertexIdsFromSelection(
+            prev.baseSelectionMode,
+            new Set(prev.baseSelectedIds),
+          );
+          if (vertIds.size < 2) {
+            showToast('Selecciona al menos 2 vértices para fusionar por vértice');
+            return prev;
+          }
+          return {
+            ...prev,
+            config: {
+              type: 'merge',
+              params: {
+                mode: 'center',
+                cursorPosition: [...cursor3D] as Vec3,
+              },
+            },
+          };
+        }
+        return {
+          ...prev,
+          config: {
+            type: 'merge_by_distance',
+            params: {
+              distance: 0.005,
+              scope: prev.baseSelectedIds.length > 0 ? 'selection' : 'all',
+            },
+          },
+        };
+      });
+    },
+    [cursor3D, showToast],
+  );
 
   const pickLoopCutEdge = useCallback(
     (edgeId: string | null) => {
@@ -2447,11 +2980,14 @@ export function useModelerStore() {
       return {
         previewMesh: null as SerializedEditableMesh | null,
         previewSelectedIds: null as Set<string> | null,
+        previewNextMode: null as EditSelectionMode | null,
         loopCutSegments: [] as [Vec3, Vec3][],
         loopCutRingEdgeIds: [] as string[],
         loopCutFaceIds: [] as string[],
         loopCutIsClosed: false,
         loopCutError: null as string | null,
+        operatorError: null as string | null,
+        operatorStatusMessage: null as string | null,
         mergedCount: 0,
       };
     }
@@ -2466,11 +3002,14 @@ export function useModelerStore() {
         return {
           previewMesh: null,
           previewSelectedIds: null,
+          previewNextMode: null,
           loopCutSegments: [] as [Vec3, Vec3][],
           loopCutRingEdgeIds: [] as string[],
           loopCutFaceIds: [] as string[],
           loopCutIsClosed: false,
           loopCutError: loopCutPickError,
+          operatorError: null,
+          operatorStatusMessage: null,
           mergedCount: 0,
         };
       }
@@ -2479,6 +3018,7 @@ export function useModelerStore() {
         return {
           previewMesh: null,
           previewSelectedIds: null,
+          previewNextMode: null,
           loopCutSegments: [] as [Vec3, Vec3][],
           loopCutRingEdgeIds: [] as string[],
           loopCutFaceIds: [] as string[],
@@ -2487,6 +3027,8 @@ export function useModelerStore() {
             analysis.reason ??
             loopCutPickError ??
             'La topología actual no forma un bucle cuadrangular.',
+          operatorError: null,
+          operatorStatusMessage: null,
           mergedCount: 0,
         };
       }
@@ -2499,11 +3041,14 @@ export function useModelerStore() {
       return {
         previewMesh: null,
         previewSelectedIds: null,
+        previewNextMode: null,
         loopCutSegments: segments,
         loopCutRingEdgeIds: analysis.ring.edgeIds,
         loopCutFaceIds: analysis.ring.faceIds,
         loopCutIsClosed: analysis.ring.isClosed,
         loopCutError: loopCutPickError,
+        operatorError: null,
+        operatorStatusMessage: null,
         mergedCount: 0,
       };
     }
@@ -2513,12 +3058,66 @@ export function useModelerStore() {
       return {
         previewMesh: mergeRes.mesh.toJSON(),
         previewSelectedIds: mergeRes.nextSelectedIds,
+        previewNextMode: null,
         loopCutSegments: [] as [Vec3, Vec3][],
         loopCutRingEdgeIds: [] as string[],
         loopCutFaceIds: [] as string[],
         loopCutIsClosed: false,
         loopCutError: null,
+        operatorError: null,
+        operatorStatusMessage: null,
         mergedCount: mergeRes.mergedCount,
+      };
+    }
+
+    if (cfg.type === 'dissolve_limited') {
+      const ldRes = limitedDissolveMesh(baseMesh, mode, baseSel, cfg.params);
+      return {
+        previewMesh: ldRes.error ? null : ldRes.result.mesh.toJSON(),
+        previewSelectedIds: ldRes.error ? null : ldRes.result.nextSelectedIds,
+        previewNextMode: null,
+        loopCutSegments: [] as [Vec3, Vec3][],
+        loopCutRingEdgeIds: [] as string[],
+        loopCutFaceIds: [] as string[],
+        loopCutIsClosed: false,
+        loopCutError: null,
+        operatorError: ldRes.error ?? null,
+        operatorStatusMessage: ldRes.message ?? null,
+        mergedCount: ldRes.dissolvedEdges + ldRes.dissolvedVertices,
+      };
+    }
+
+    if (cfg.type === 'bridge_loops') {
+      const brRes = bridgeEdgeLoopsMesh(baseMesh, mode, baseSel, cfg.params);
+      return {
+        previewMesh: brRes.error ? null : brRes.result.mesh.toJSON(),
+        previewSelectedIds: brRes.error ? null : brRes.result.nextSelectedIds,
+        previewNextMode: brRes.nextMode ?? null,
+        loopCutSegments: [] as [Vec3, Vec3][],
+        loopCutRingEdgeIds: [] as string[],
+        loopCutFaceIds: [] as string[],
+        loopCutIsClosed: false,
+        loopCutError: null,
+        operatorError: brRes.error ?? null,
+        operatorStatusMessage: brRes.message ?? null,
+        mergedCount: brRes.createdFaces,
+      };
+    }
+
+    if (cfg.type === 'merge') {
+      const mRes = mergeVerticesMesh(baseMesh, mode, baseSel, cfg.params);
+      return {
+        previewMesh: mRes.mesh.toJSON(),
+        previewSelectedIds: mRes.nextSelectedIds,
+        previewNextMode: mRes.nextMode ?? null,
+        loopCutSegments: [] as [Vec3, Vec3][],
+        loopCutRingEdgeIds: [] as string[],
+        loopCutFaceIds: [] as string[],
+        loopCutIsClosed: false,
+        loopCutError: null,
+        operatorError: mRes.error ?? null,
+        operatorStatusMessage: mRes.message ?? null,
+        mergedCount: mRes.mergedCount ?? 0,
       };
     }
 
@@ -2529,20 +3128,21 @@ export function useModelerStore() {
       res = insetFacesMesh(baseMesh, mode, baseSel, cfg.params);
     } else if (cfg.type === 'subdivide') {
       res = subdivideMesh(baseMesh, mode, baseSel, cfg.params);
-    } else if (cfg.type === 'bevel') {
-      res = bevelMesh(baseMesh, mode, baseSel, cfg.params);
     } else {
-      res = mergeVerticesMesh(baseMesh, mode, baseSel, cfg.params);
+      res = bevelMesh(baseMesh, mode, baseSel, cfg.params);
     }
 
     return {
       previewMesh: res.mesh.toJSON(),
       previewSelectedIds: res.nextSelectedIds,
+      previewNextMode: null,
       loopCutSegments: [] as [Vec3, Vec3][],
       loopCutRingEdgeIds: [] as string[],
       loopCutFaceIds: [] as string[],
       loopCutIsClosed: false,
       loopCutError: null,
+      operatorError: null,
+      operatorStatusMessage: null,
       mergedCount: 0,
     };
   }, [loopCutPickError, operatorSession]);
@@ -2554,7 +3154,8 @@ export function useModelerStore() {
 
     let finalMesh: EditableMesh;
     let nextSelected: Set<string>;
-    let nextMode: EditSelectionMode = operatorSession.baseSelectionMode;
+    let nextMode: EditSelectionMode =
+      operatorPreview.previewNextMode ?? operatorSession.baseSelectionMode;
     let loopCutFeedback: string | null = null;
 
     if (cfg.type === 'loop_cut') {
@@ -2574,6 +3175,9 @@ export function useModelerStore() {
       if (stats) {
         loopCutFeedback = `Loop Cut aplicado · ${stats.splitFaces} cara${stats.splitFaces === 1 ? '' : 's'} dividida${stats.splitFaces === 1 ? '' : 's'} (${cfg.params.cuts} corte${cfg.params.cuts === 1 ? '' : 's'})`;
       }
+    } else if (operatorPreview.operatorError) {
+      showToast(operatorPreview.operatorError);
+      return;
     } else if (operatorPreview.previewMesh) {
       finalMesh = EditableMesh.fromJSON(operatorPreview.previewMesh);
       nextSelected = operatorPreview.previewSelectedIds ?? new Set();
@@ -2614,6 +3218,7 @@ export function useModelerStore() {
     setSelectedComponentIds(nextSelected);
     const mergedCountFeedback =
       cfg.type === 'merge_by_distance' ? operatorPreview.mergedCount : null;
+    const statusFeedback = operatorPreview.operatorStatusMessage;
     setOperatorSession(null);
     setLoopCutPickError(null);
     releaseScreenModifiers();
@@ -2627,6 +3232,8 @@ export function useModelerStore() {
           ? 'No hubo vértices dentro del umbral de distancia'
           : `${mergedCountFeedback} vértice${mergedCountFeedback === 1 ? '' : 's'} fusionado${mergedCountFeedback === 1 ? '' : 's'} por distancia`,
       );
+    } else if (statusFeedback) {
+      showToast(statusFeedback);
     }
   }, [
     makeSnapshot,
@@ -2652,7 +3259,6 @@ export function useModelerStore() {
         return;
       }
       setOperatorSession(null);
-      pushHistory(makeSnapshot());
       const mesh = EditableMesh.fromJSON(selectedObject.mesh);
       const res = applyDeleteAction(
         mesh,
@@ -2660,6 +3266,11 @@ export function useModelerStore() {
         selectedComponentIds,
         action,
       );
+      if (res.error) {
+        showToast(res.error);
+        return;
+      }
+      pushHistory(makeSnapshot());
       res.mesh.clearCustomNormals();
       const updated = res.mesh.toJSON();
       setProject((p) =>
@@ -2673,6 +3284,9 @@ export function useModelerStore() {
       setSelectedComponentIds(res.nextSelectedIds);
       setHasUnsavedChanges(true);
       setMeshRevision((r) => r + 1);
+      if (res.message) {
+        showToast(res.message);
+      }
     },
     [
       editSelectionMode,
@@ -3059,6 +3673,122 @@ export function useModelerStore() {
     workMode,
   ]);
 
+  const triggerGQuickTapMove = useCallback(() => {
+    setOperatorSession(null);
+    releaseScreenModifiers();
+    setActiveToolState('move');
+
+    if (!selectedObject) {
+      setModalTransform(null);
+      showToast('Selecciona un objeto para mover');
+      return;
+    }
+    if (selectedObject.locked) {
+      setModalTransform(null);
+      showToast('El objeto está bloqueado');
+      return;
+    }
+    if (workMode === 'edit' && selectedComponentIds.size === 0) {
+      setModalTransform(null);
+      showToast('Herramienta Mover activa (selecciona geometría para mover)');
+      return;
+    }
+
+    setModalTransform({ mode: 'move', clamp: true });
+  }, [
+    releaseScreenModifiers,
+    selectedComponentIds.size,
+    selectedObject,
+    showToast,
+    workMode,
+  ]);
+
+  const triggerGHoldSlide = useCallback(() => {
+    setOperatorSession(null);
+    releaseScreenModifiers();
+
+    if (!selectedObject) {
+      setActiveToolState('move');
+      setModalTransform(null);
+      showToast('Selecciona un objeto o componente primero');
+      return;
+    }
+    if (selectedObject.locked) {
+      setModalTransform(null);
+      showToast('El objeto está bloqueado');
+      return;
+    }
+
+    // Object Mode or Face Mode falls back cleanly to Move (per design spec)
+    if (workMode === 'object' || editSelectionMode === 'face') {
+      setActiveToolState('move');
+      if (workMode === 'object' || selectedComponentIds.size > 0) {
+        setModalTransform({ mode: 'move', clamp: true });
+      } else {
+        setModalTransform(null);
+      }
+      showToast(
+        workMode === 'edit'
+          ? 'Slide no aplica en caras: usando Mover'
+          : 'Modo Objeto: usando Mover',
+      );
+      return;
+    }
+
+    const mesh = EditableMesh.fromJSON(selectedObject.mesh);
+    if (editSelectionMode === 'vertex') {
+      if (selectedComponentIds.size === 0) {
+        setModalTransform(null);
+        showToast('Selecciona al menos un vértice para Vertex Slide');
+        return;
+      }
+      const plan = buildVertexSlidePlan(mesh, selectedComponentIds);
+      if (!plan.valid) {
+        setModalTransform(null);
+        showToast(plan.reason ?? 'No hay aristas conectadas para Vertex Slide');
+        return;
+      }
+      setModalTransform({ mode: 'vertex_slide', clamp: true });
+      return;
+    }
+
+    // Edge selection mode -> Edge Slide
+    if (selectedComponentIds.size === 0) {
+      setModalTransform(null);
+      showToast('Selecciona al menos una arista para Edge Slide');
+      return;
+    }
+    const plan = buildEdgeSlidePlan(mesh, selectedComponentIds);
+    if (!plan.valid) {
+      setModalTransform(null);
+      showToast(plan.reason ?? 'No hay caras vecinas válidas para Edge Slide');
+      return;
+    }
+    setModalTransform({ mode: 'edge_slide', clamp: true });
+  }, [
+    editSelectionMode,
+    releaseScreenModifiers,
+    selectedComponentIds,
+    selectedObject,
+    showToast,
+    workMode,
+  ]);
+
+  const setModalTransformClamp = useCallback((clamp: boolean) => {
+    setModalTransform((prev) => (prev ? { ...prev, clamp } : prev));
+  }, []);
+
+  const cancelModalTransform = useCallback(() => {
+    setModalCancelNonce((n) => n + 1);
+    setModalTransform(null);
+  }, []);
+
+  const completeModalTransform = useCallback((committed: boolean) => {
+    if (committed) {
+      setModalTransform(null);
+    }
+  }, []);
+
   return {
     project,
     scenes: renderedScenes,
@@ -3073,6 +3803,8 @@ export function useModelerStore() {
     selectedObjectIds,
     workMode,
     editSelectionMode,
+    edgeSelectionTool,
+    cursor3D,
     selectedComponentIds: renderedSelectedComponentIds,
     selectedModifierDiagnostics,
     proportionalModifierWarning,
@@ -3087,13 +3819,22 @@ export function useModelerStore() {
     canUndo,
     canRedo,
     operatorSession,
+    modalTransform,
+    modalCancelNonce,
     operatorMergedCount: operatorPreview.mergedCount,
+    operatorError: operatorPreview.operatorError,
+    operatorStatusMessage: operatorPreview.operatorStatusMessage,
     loopCutPreviewSegments: operatorPreview.loopCutSegments,
     loopCutRingEdgeIds: operatorPreview.loopCutRingEdgeIds,
     loopCutFaceIds: operatorPreview.loopCutFaceIds,
     loopCutIsClosed: operatorPreview.loopCutIsClosed,
     loopCutError: operatorPreview.loopCutError,
     setActiveTool,
+    triggerGQuickTapMove,
+    triggerGHoldSlide,
+    setModalTransformClamp,
+    cancelModalTransform,
+    completeModalTransform,
     setAxisConstraint,
     setProjection,
     setProjectName,
@@ -3108,6 +3849,8 @@ export function useModelerStore() {
     selectObjectInScene,
     toggleWorkMode,
     changeEditSelectionMode,
+    setEdgeSelectionTool,
+    setCursor3D,
     updateObjectTransform,
     commitObjectTransformFromGizmo,
     commitMeshEditFromGizmo,
@@ -3116,6 +3859,9 @@ export function useModelerStore() {
     toggleObjectLock,
     duplicateSelectedObject,
     duplicateObjectById,
+    applyObjectTransform,
+    centerObjectOrigin,
+    separateSelectedGeometry,
     deleteObject,
     deleteSelectedObjects,
     createScene,
@@ -3146,6 +3892,7 @@ export function useModelerStore() {
     flipObjectNormals,
     selectComponentFromViewport,
     selectComponentsFromBox,
+    selectEdgeTopology,
     toggleScreenShift,
     setScreenShiftActive,
     setScreenModifier,
@@ -3176,6 +3923,7 @@ export function useModelerStore() {
     applyModifier,
     startEditOperator,
     updateOperatorConfig,
+    switchMergeOperator,
     pickLoopCutEdge,
     confirmEditOperator,
     cancelEditOperator,

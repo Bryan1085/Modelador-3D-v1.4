@@ -1,7 +1,9 @@
 import {
   canonicalEdgeKey,
   EditableMesh,
+  MeshEdge,
   MeshFace,
+  Vec2,
   Vec3,
 } from './EditableMesh';
 import {
@@ -12,6 +14,27 @@ import {
 } from './operations';
 import { connectVertexPathMesh } from './connectVertexPath';
 import { flipNormalsMesh, recalculateOutsideMesh } from './normals';
+import {
+  analyzeBridgeEdgeLoops,
+  BridgeEdgeLoopsAnalysis,
+  bridgeEdgeLoopsMesh,
+  BridgeEdgeLoopsParams,
+  BridgeEdgeLoopsResult,
+  dissolveEdgesMesh,
+  dissolveFacesMesh,
+  DissolveOperationResult,
+  dissolveVerticesMesh,
+  limitedDissolveMesh,
+  LimitedDissolveParams,
+  LimitedDissolveResult,
+} from './topologyTools';
+import {
+  EdgeLoopSelectionResult,
+  EdgeSelectionTool,
+  findEdgeLoop,
+  findEdgeRing,
+  resolveEdgeLoopSelection,
+} from './loopSelect';
 
 import {
   analyzeEdgeLoopRing,
@@ -28,21 +51,65 @@ import {
   LoopCutParams,
 } from './loopCut';
 
+import {
+  applyEdgeSlide,
+  applyVertexSlideAlongDirection,
+  applyVertexSlideFromScreenSelections,
+  buildEdgeSlidePlan,
+  buildVertexSlidePlan,
+  EdgeSlidePlan,
+  EdgeSlideRail,
+  SlideApplyResult,
+  SlideMode,
+  VertexRailOption,
+  VertexSlidePlan,
+  VertexSlideSelection,
+} from './slideTools';
+
 export type {
+  BridgeEdgeLoopsAnalysis,
+  BridgeEdgeLoopsParams,
+  BridgeEdgeLoopsResult,
+  DissolveOperationResult,
   EdgeLoopQuadStep,
   EdgeLoopRing,
+  EdgeLoopSelectionResult,
+  EdgeSelectionTool,
+  EdgeSlidePlan,
+  EdgeSlideRail,
+  LimitedDissolveParams,
+  LimitedDissolveResult,
   LoopCutAnalysis,
   LoopCutBlockReason,
   LoopCutExecutionResult,
   LoopCutParams,
+  SlideApplyResult,
+  SlideMode,
+  VertexRailOption,
+  VertexSlidePlan,
+  VertexSlideSelection,
 };
 export {
+  analyzeBridgeEdgeLoops,
   analyzeEdgeLoopRing,
+  applyEdgeSlide,
+  applyVertexSlideAlongDirection,
+  applyVertexSlideFromScreenSelections,
+  bridgeEdgeLoopsMesh,
+  buildEdgeSlidePlan,
+  buildVertexSlidePlan,
   computeLoopCutFractions,
   computeLoopCutPreviewSegments,
+  dissolveEdgesMesh,
+  dissolveFacesMesh,
+  dissolveVerticesMesh,
+  findEdgeLoop,
   findEdgeLoopRing,
+  findEdgeRing,
   findFirstValidLoopEdge,
+  limitedDissolveMesh,
   loopCutMesh,
+  resolveEdgeLoopSelection,
 };
 
 export type ExtrudeAxis = 'normal' | 'x' | 'y' | 'z';
@@ -1987,12 +2054,61 @@ export function bevelMesh(
 /* ============================================================================
  * F. MERGE — FUSIONAR VÉRTICES
  * ========================================================================== */
+export interface MergeOperationResult extends MeshOperatorResult {
+  nextMode?: EditSelectionMode;
+  mergedCount: number;
+  message?: string;
+  error?: string;
+}
+
+function remapFaceVertsAndUvs(
+  mesh: EditableMesh,
+  face: MeshFace,
+  remap: (vid: string) => string,
+): boolean {
+  const hasUvs =
+    Array.isArray(face.uvs) && face.uvs.length === face.vertexIds.length;
+  const collapsedVerts: string[] = [];
+  const collapsedUvs: Vec2[] = [];
+
+  for (let i = 0; i < face.vertexIds.length; i++) {
+    const mapped = remap(face.vertexIds[i]);
+    if (!mesh.getVertex(mapped)) continue;
+    if (
+      collapsedVerts.length === 0 ||
+      collapsedVerts[collapsedVerts.length - 1] !== mapped
+    ) {
+      collapsedVerts.push(mapped);
+      if (hasUvs) collapsedUvs.push([...face.uvs![i]] as Vec2);
+    }
+  }
+  if (
+    collapsedVerts.length > 1 &&
+    collapsedVerts[0] === collapsedVerts[collapsedVerts.length - 1]
+  ) {
+    collapsedVerts.pop();
+    if (hasUvs) collapsedUvs.pop();
+  }
+
+  const clean = sanitizePolygonVerts(mesh, collapsedVerts);
+  if (!clean) return false;
+
+  face.vertexIds = clean;
+  if (hasUvs && collapsedUvs.length === clean.length) {
+    face.uvs = collapsedUvs;
+  } else {
+    delete face.uvs;
+  }
+  delete face.normals;
+  return true;
+}
+
 export function mergeVerticesMesh(
   sourceMesh: EditableMesh,
   mode: EditSelectionMode,
   selectedIds: Set<string>,
   params: MergeParams,
-): MeshOperatorResult {
+): MergeOperationResult {
   const mesh = sourceMesh.clone();
   const nextSelected = new Set<string>();
 
@@ -2008,7 +2124,12 @@ export function mergeVerticesMesh(
 
   if (orderedVertIds.length < 2) {
     if (orderedVertIds.length === 1) nextSelected.add(orderedVertIds[0]);
-    return { mesh, nextSelectedIds: nextSelected };
+    return {
+      mesh,
+      nextSelectedIds: nextSelected,
+      mergedCount: 0,
+      error: 'Selecciona al menos 2 vértices para fusionar.',
+    };
   }
 
   const mergeSet = new Set(orderedVertIds);
@@ -2028,33 +2149,74 @@ export function mergeVerticesMesh(
   const keepVert = mesh.getVertex(keepId)!;
   keepVert.position = [targetPos[0], targetPos[1], targetPos[2]];
 
-  // Remap edges
-  for (const edge of mesh.edges) {
-    if (mergeSet.has(edge.v0)) edge.v0 = keepId;
-    if (mergeSet.has(edge.v1)) edge.v1 = keepId;
-  }
-
-  // Remap faces and collapse consecutive duplicates
-  const nextFaces: MeshFace[] = [];
-  for (const face of mesh.faces) {
-    const remapped = face.vertexIds.map((vid) =>
-      mergeSet.has(vid) ? keepId : vid,
-    );
-    const collapsed: string[] = [];
-    for (const vid of remapped) {
-      if (collapsed.length === 0 || collapsed[collapsed.length - 1] !== vid) {
-        collapsed.push(vid);
+  // Preserve or average UVs onto the surviving vertex
+  if (params.mode === 'center' || params.mode === 'cursor') {
+    let uvSumU = 0;
+    let uvSumV = 0;
+    let uvCount = 0;
+    for (const vid of orderedVertIds) {
+      const uv = mesh.getVertex(vid)?.uv;
+      if (uv) {
+        uvSumU += uv[0];
+        uvSumV += uv[1];
+        uvCount++;
       }
     }
-    if (collapsed.length > 1 && collapsed[0] === collapsed[collapsed.length - 1]) {
-      collapsed.pop();
+    if (uvCount > 0) {
+      keepVert.uv = [uvSumU / uvCount, uvSumV / uvCount];
     }
-    // Also ensure keepId doesn't create a bow-tie pinch inside the same face
-    const uniqueCount = new Set(collapsed).size;
-    if (collapsed.length >= 3 && uniqueCount >= 3) {
-      face.vertexIds = collapsed;
-      nextFaces.push(face);
+  }
+
+  // Remap edges: drop self-loops and deduplicate via canonicalEdgeKey
+  const edgeMapByKey = new Map<string, string>();
+  const edgeRemap = new Map<string, string>();
+  const nextEdges: MeshEdge[] = [];
+  for (const edge of mesh.edges) {
+    const v0 = mergeSet.has(edge.v0) ? keepId : edge.v0;
+    const v1 = mergeSet.has(edge.v1) ? keepId : edge.v1;
+    if (v0 === v1) continue;
+    const key = canonicalEdgeKey(v0, v1);
+    const existingId = edgeMapByKey.get(key);
+    if (existingId) {
+      edgeRemap.set(edge.id, existingId);
+      const keeperEdge = nextEdges.find((e) => e.id === existingId);
+      if (
+        keeperEdge &&
+        typeof edge.bevelWeight === 'number' &&
+        (typeof keeperEdge.bevelWeight !== 'number' ||
+          edge.bevelWeight > keeperEdge.bevelWeight)
+      ) {
+        keeperEdge.bevelWeight = edge.bevelWeight;
+      }
+      continue;
     }
+    edge.v0 = v0;
+    edge.v1 = v1;
+    edgeMapByKey.set(key, edge.id);
+    edgeRemap.set(edge.id, edge.id);
+    nextEdges.push(edge);
+  }
+  mesh.edges = nextEdges;
+
+  // Remap faces, collapse consecutive duplicates, drop degenerate & duplicate faces
+  const seenFaceKeys = new Set<string>();
+  const faceRemap = new Map<string, string>();
+  const nextFaces: MeshFace[] = [];
+  for (const face of mesh.faces) {
+    if (!remapFaceVertsAndUvs(mesh, face, (vid) => (mergeSet.has(vid) ? keepId : vid))) {
+      continue;
+    }
+    const fkey = canonicalFaceVertexSetKey(face.vertexIds);
+    if (seenFaceKeys.has(fkey)) {
+      const keeper = nextFaces.find(
+        (nf) => canonicalFaceVertexSetKey(nf.vertexIds) === fkey,
+      );
+      if (keeper) faceRemap.set(face.id, keeper.id);
+      continue;
+    }
+    seenFaceKeys.add(fkey);
+    nextFaces.push(face);
+    faceRemap.set(face.id, face.id);
   }
   mesh.faces = nextFaces;
 
@@ -2062,14 +2224,39 @@ export function mergeVerticesMesh(
   mesh.vertices = mesh.vertices.filter(
     (v) => v.id === keepId || !mergeSet.has(v.id),
   );
-  mesh.rebuildIndices();
-
-  if (mode === 'vertex') {
-    nextSelected.add(keepId);
-  }
   mesh.clearCustomNormals();
   mesh.rebuildIndices();
-  return { mesh, nextSelectedIds: nextSelected };
+
+  let nextMode: EditSelectionMode | undefined;
+  if (mode === 'vertex') {
+    nextSelected.add(keepId);
+  } else if (mode === 'edge') {
+    for (const id of selectedIds) {
+      const mapped = edgeRemap.get(id);
+      if (mapped && mesh.getEdge(mapped)) nextSelected.add(mapped);
+    }
+    if (nextSelected.size === 0 && mesh.getVertex(keepId)) {
+      nextSelected.add(keepId);
+      nextMode = 'vertex';
+    }
+  } else if (mode === 'face') {
+    for (const id of selectedIds) {
+      const mapped = faceRemap.get(id);
+      if (mapped && mesh.getFace(mapped)) nextSelected.add(mapped);
+    }
+    if (nextSelected.size === 0 && mesh.getVertex(keepId)) {
+      nextSelected.add(keepId);
+      nextMode = 'vertex';
+    }
+  }
+
+  return {
+    mesh,
+    nextSelectedIds: nextSelected,
+    nextMode,
+    mergedCount: orderedVertIds.length - 1,
+    message: `${orderedVertIds.length} vértices fusionados`,
+  };
 }
 
 /* ============================================================================
@@ -2163,6 +2350,20 @@ export function mergeByDistanceMesh(
     if (members.length >= 2) {
       const centroid = mesh.computeCentroid(members) ?? anchorVert.position;
       anchorVert.position = [centroid[0], centroid[1], centroid[2]];
+      let uvU = 0;
+      let uvV = 0;
+      let uvN = 0;
+      for (const mId of members) {
+        const uv = mesh.getVertex(mId)?.uv;
+        if (uv) {
+          uvU += uv[0];
+          uvV += uv[1];
+          uvN++;
+        }
+      }
+      if (uvN > 0) {
+        anchorVert.uv = [uvU / uvN, uvV / uvN];
+      }
       for (let i = 1; i < members.length; i++) {
         vertRemap.set(members[i], anchorId);
         mergedCount++;
@@ -2200,15 +2401,15 @@ export function mergeByDistanceMesh(
   }
   mesh.edges = nextEdges;
 
-  // Remap faces: collapse consecutive duplicates, drop <3 unique verts / zero-area / duplicates
+  // Remap faces: collapse consecutive duplicates, preserve UVs, drop <3 unique verts / zero-area / duplicates
   const seenFaceKeys = new Set<string>();
   const faceRemap = new Map<string, string>();
   const nextFaces: MeshFace[] = [];
   for (const face of mesh.faces) {
-    const remapped = face.vertexIds.map((vid) => vertRemap.get(vid) ?? vid);
-    const clean = sanitizePolygonVerts(mesh, remapped);
-    if (!clean) continue;
-    const fkey = canonicalFaceVertexSetKey(clean);
+    if (!remapFaceVertsAndUvs(mesh, face, (vid) => vertRemap.get(vid) ?? vid)) {
+      continue;
+    }
+    const fkey = canonicalFaceVertexSetKey(face.vertexIds);
     if (seenFaceKeys.has(fkey)) {
       const keeper = nextFaces.find(
         (nf) => canonicalFaceVertexSetKey(nf.vertexIds) === fkey,
@@ -2217,7 +2418,6 @@ export function mergeByDistanceMesh(
       continue;
     }
     seenFaceKeys.add(fkey);
-    face.vertexIds = clean;
     nextFaces.push(face);
     faceRemap.set(face.id, face.id);
   }
@@ -2253,78 +2453,9 @@ export function mergeByDistanceMesh(
 /* ============================================================================
  * G. DELETE & DISSOLVE — MENÚ CONTEXTUAL DE ELIMINACIÓN
  * ========================================================================== */
-function dissolveSingleEdgeInPlace(mesh: EditableMesh, edgeId: string): boolean {
-  const edge = mesh.getEdge(edgeId);
-  if (!edge) return false;
-  const adjFaces = mesh.getFacesForEdge(edgeId);
-
-  if (adjFaces.length === 0) {
-    mesh.deleteEdges(new Set([edgeId]));
-    return true;
-  }
-
-  if (adjFaces.length !== 2 || adjFaces[0] === adjFaces[1]) {
-    return false;
-  }
-
-  const f1 = mesh.getFace(adjFaces[0]);
-  const f2 = mesh.getFace(adjFaces[1]);
-  if (!f1 || !f2) return false;
-
-  // Find directed edge (u -> v) in f1, and (v -> u) in f2
-  const n1 = f1.vertexIds.length;
-  let idx1 = -1;
-  let u = '';
-  let v = '';
-  for (let i = 0; i < n1; i++) {
-    const a = f1.vertexIds[i];
-    const b = f1.vertexIds[(i + 1) % n1];
-    if (canonicalEdgeKey(a, b) === canonicalEdgeKey(edge.v0, edge.v1)) {
-      idx1 = i;
-      u = a;
-      v = b;
-      break;
-    }
-  }
-  if (idx1 === -1) return false;
-
-  const n2 = f2.vertexIds.length;
-  let idx2 = -1;
-  let f2Reversed = false;
-  for (let i = 0; i < n2; i++) {
-    const a = f2.vertexIds[i];
-    const b = f2.vertexIds[(i + 1) % n2];
-    if (a === v && b === u) {
-      idx2 = i;
-      f2Reversed = false;
-      break;
-    }
-    if (a === u && b === v) {
-      idx2 = i;
-      f2Reversed = true;
-      break;
-    }
-  }
-  if (idx2 === -1) return false;
-
-  const f2Ordered = f2Reversed ? [...f2.vertexIds].reverse() : f2.vertexIds;
-  const startInF2 = f2Ordered.indexOf(v);
-
-  // Build merged polygon: walk f1 from v .. u (n1 vertices), then f2 from after u .. before v (n2 - 2 vertices)
-  const merged: string[] = [];
-  for (let step = 0; step < n1; step++) {
-    merged.push(f1.vertexIds[(idx1 + 1 + step) % n1]);
-  }
-  for (let step = 2; step < n2; step++) {
-    merged.push(f2Ordered[(startInF2 + step) % n2]);
-  }
-
-  if (merged.length < 3 || new Set(merged).size < 3) return false;
-
-  mesh.deleteFaces(new Set([f1.id, f2.id]));
-  mesh.deleteEdges(new Set([edgeId]));
-  mesh.addFace(merged);
-  return true;
+export interface DeleteActionResult extends MeshOperatorResult {
+  message?: string;
+  error?: string;
 }
 
 export function applyDeleteAction(
@@ -2332,7 +2463,7 @@ export function applyDeleteAction(
   mode: EditSelectionMode,
   selectedIds: Set<string>,
   action: DeleteActionType,
-): MeshOperatorResult {
+): DeleteActionResult {
   const mesh = sourceMesh.clone();
   const nextSelected = new Set<string>();
 
@@ -2343,135 +2474,37 @@ export function applyDeleteAction(
   switch (action) {
     case 'delete_vertices': {
       mesh.deleteVertices(selectedIds);
-      break;
+      return { mesh, nextSelectedIds: nextSelected };
     }
     case 'dissolve_vertices': {
-      for (const vid of Array.from(selectedIds)) {
-        if (!mesh.getVertex(vid)) continue;
-        const incEdges = mesh.getEdgesForVertex(vid);
-        const incFaces = mesh.getFacesForVertex(vid);
-        if (incEdges.length === 2 && incFaces.length === 0) {
-          const eA = mesh.getEdge(incEdges[0]);
-          const eB = mesh.getEdge(incEdges[1]);
-          if (eA && eB) {
-            const nA = eA.v0 === vid ? eA.v1 : eA.v0;
-            const nB = eB.v0 === vid ? eB.v1 : eB.v0;
-            mesh.deleteVertices(new Set([vid]));
-            mesh.addEdge(nA, nB);
-          }
-        } else if (incFaces.length === 1) {
-          const f = mesh.getFace(incFaces[0]);
-          if (f) {
-            const filtered = f.vertexIds.filter((id) => id !== vid);
-            mesh.deleteFaces(new Set([f.id]));
-            mesh.deleteVertices(new Set([vid]));
-            if (filtered.length >= 3) mesh.addFace(filtered);
-          }
-        } else if (incFaces.length >= 2) {
-          // Merge the star of faces around vid into one polygon by chaining next -> ... -> prev
-          const chains: {
-            faceId: string;
-            start: string;
-            end: string;
-            verts: string[];
-          }[] = [];
-          for (const fid of incFaces) {
-            const f = mesh.getFace(fid);
-            if (!f) continue;
-            const idx = f.vertexIds.indexOf(vid);
-            if (idx === -1) continue;
-            const k = f.vertexIds.length;
-            const verts: string[] = [];
-            for (let s = 1; s < k; s++) {
-              verts.push(f.vertexIds[(idx + s) % k]);
-            }
-            if (verts.length >= 2) {
-              chains.push({
-                faceId: fid,
-                start: verts[0],
-                end: verts[verts.length - 1],
-                verts,
-              });
-            }
-          }
-
-          if (chains.length === incFaces.length) {
-            const used = new Set<string>([chains[0].faceId]);
-            const merged: string[] = [...chains[0].verts];
-            let currEnd = chains[0].end;
-            let closed = false;
-
-            for (let iter = 0; iter < chains.length; iter++) {
-              // Match next chain whose start === currEnd (same winding) or end === currEnd (reversed winding)
-              let matched = chains.find(
-                (c) => !used.has(c.faceId) && c.start === currEnd,
-              );
-              let sliceVerts: string[] | null = null;
-              if (matched) {
-                sliceVerts = matched.verts.slice(1);
-              } else {
-                matched = chains.find(
-                  (c) => !used.has(c.faceId) && c.end === currEnd,
-                );
-                if (matched) {
-                  sliceVerts = [...matched.verts].reverse().slice(1);
-                }
-              }
-              if (!matched || !sliceVerts) break;
-              used.add(matched.faceId);
-              merged.push(...sliceVerts);
-              currEnd = merged[merged.length - 1];
-              if (currEnd === merged[0] && used.size === chains.length) {
-                merged.pop();
-                closed = true;
-                break;
-              }
-            }
-
-            if (closed && merged.length >= 3 && new Set(merged).size >= 3) {
-              mesh.deleteFaces(new Set(incFaces));
-              mesh.deleteVertices(new Set([vid]));
-              mesh.addFace(merged);
-            } else {
-              // Open boundary fan fallback: strip vid from individual faces
-              const toDelete = new Set<string>(incFaces);
-              const toAdd: string[][] = [];
-              for (const fid of incFaces) {
-                const f = mesh.getFace(fid);
-                if (!f) continue;
-                const filtered = f.vertexIds.filter((id) => id !== vid);
-                if (filtered.length >= 3) toAdd.push(filtered);
-              }
-              mesh.deleteFaces(toDelete);
-              mesh.deleteVertices(new Set([vid]));
-              for (const verts of toAdd) mesh.addFace(verts);
-            }
-          }
-        } else {
-          mesh.deleteVertices(new Set([vid]));
-        }
-      }
-      break;
+      const res = dissolveVerticesMesh(sourceMesh, mode, selectedIds);
+      return {
+        ...res.result,
+        message: res.message,
+        error: res.error,
+      };
     }
     case 'delete_edges': {
       mesh.deleteEdges(selectedIds);
-      break;
+      return { mesh, nextSelectedIds: nextSelected };
     }
     case 'delete_edges_and_vertices': {
       const candidateVerts = mesh.getVertexIdsFromSelection('edge', selectedIds);
       mesh.deleteEdges(selectedIds);
       mesh.pruneOrphanVertices(candidateVerts);
-      break;
+      return { mesh, nextSelectedIds: nextSelected };
     }
     case 'dissolve_edges': {
-      for (const eid of Array.from(selectedIds)) {
-        dissolveSingleEdgeInPlace(mesh, eid);
-      }
-      break;
+      const res = dissolveEdgesMesh(sourceMesh, mode, selectedIds);
+      return {
+        ...res.result,
+        message: res.message,
+        error: res.error,
+      };
     }
     case 'delete_only_faces': {
       mesh.deleteFaces(selectedIds);
-      break;
+      return { mesh, nextSelectedIds: nextSelected };
     }
     case 'delete_faces_and_edges': {
       const candidateEdges = new Set<string>();
@@ -2486,30 +2519,17 @@ export function applyDeleteAction(
       }
       mesh.deleteEdges(orphanEdges);
       mesh.pruneOrphanVertices(candidateVerts);
-      break;
+      return { mesh, nextSelectedIds: nextSelected };
     }
     case 'dissolve_faces': {
-      // Find internal edges shared by 2 selected faces and dissolve them
-      const faceSet = new Set(selectedIds);
-      const internalEdges: string[] = [];
-      for (const edge of mesh.edges) {
-        const adj = mesh.getFacesForEdge(edge.id);
-        if (adj.length === 2 && faceSet.has(adj[0]) && faceSet.has(adj[1])) {
-          internalEdges.push(edge.id);
-        }
-      }
-      for (const eid of internalEdges) {
-        dissolveSingleEdgeInPlace(mesh, eid);
-      }
-      break;
+      const res = dissolveFacesMesh(sourceMesh, mode, selectedIds);
+      return {
+        ...res.result,
+        message: res.message,
+        error: res.error,
+      };
     }
   }
-
-  // Keep mode-clean empty selection after deletion
-  if (mode === 'vertex' || mode === 'edge' || mode === 'face') {
-    return { mesh, nextSelectedIds: nextSelected };
-  }
-  return { mesh, nextSelectedIds: nextSelected };
 }
 
 /* ============================================================================
@@ -2857,7 +2877,60 @@ export function fillMesh(
       const e = mesh.getEdge(eid);
       if (e) selEdges.push(e);
     }
+    // Reject branching edge selections or multiple closed loops (which belong to Bridge Edge Loops)
+    const edgeDeg = new Map<string, number>();
+    for (const e of selEdges) {
+      edgeDeg.set(e.v0, (edgeDeg.get(e.v0) ?? 0) + 1);
+      edgeDeg.set(e.v1, (edgeDeg.get(e.v1) ?? 0) + 1);
+    }
+    for (const deg of edgeDeg.values()) {
+      if (deg > 2) {
+        return {
+          result: { mesh, nextSelectedIds: new Set(selectedIds) },
+          error:
+            'La selección de aristas contiene ramificaciones y no forma un contorno simple.',
+        };
+      }
+    }
     orderedLoop = buildTopoContourLoop(vertIds, selEdges);
+    if (!orderedLoop && selEdges.length >= 6) {
+      // Check if multiple closed cycles were selected (e.g. two loops intended for Bridge)
+      const adjComp = new Map<string, string[]>();
+      for (const e of selEdges) {
+        if (!adjComp.has(e.v0)) adjComp.set(e.v0, []);
+        if (!adjComp.has(e.v1)) adjComp.set(e.v1, []);
+        adjComp.get(e.v0)!.push(e.v1);
+        adjComp.get(e.v1)!.push(e.v0);
+      }
+      let closedCount = 0;
+      const seenC = new Set<string>();
+      for (const startV of adjComp.keys()) {
+        if (seenC.has(startV)) continue;
+        const comp: string[] = [];
+        const q = [startV];
+        seenC.add(startV);
+        while (q.length > 0) {
+          const cur = q.shift()!;
+          comp.push(cur);
+          for (const nx of adjComp.get(cur) ?? []) {
+            if (!seenC.has(nx)) {
+              seenC.add(nx);
+              q.push(nx);
+            }
+          }
+        }
+        if (comp.length >= 3 && comp.every((v) => (adjComp.get(v)?.length ?? 0) === 2)) {
+          closedCount++;
+        }
+      }
+      if (closedCount >= 2) {
+        return {
+          result: { mesh, nextSelectedIds: new Set(selectedIds) },
+          error:
+            'Se detectaron múltiples contornos cerrados. Usa Bridge Edge Loops o selecciona un solo contorno.',
+        };
+      }
+    }
   } else {
     const subEdges = mesh.edges.filter(
       (e) => vertIdsSet.has(e.v0) && vertIdsSet.has(e.v1),
@@ -3011,6 +3084,35 @@ export function fillMesh(
     };
   }
 
+  // Preserve corner UVs from vertices or adjacent faces when available
+  const uvByVert = new Map<string, Vec2>();
+  for (const vid of orderedLoop) {
+    const v = mesh.getVertex(vid);
+    if (v?.uv) uvByVert.set(vid, [v.uv[0], v.uv[1]]);
+  }
+  if (uvByVert.size < orderedLoop.length) {
+    for (const adjFace of mesh.faces) {
+      if (
+        adjFace.id === face.id ||
+        !Array.isArray(adjFace.uvs) ||
+        adjFace.uvs.length !== adjFace.vertexIds.length
+      ) {
+        continue;
+      }
+      for (let i = 0; i < adjFace.vertexIds.length; i++) {
+        const vid = adjFace.vertexIds[i];
+        if (!uvByVert.has(vid)) {
+          uvByVert.set(vid, [adjFace.uvs[i][0], adjFace.uvs[i][1]]);
+        }
+      }
+    }
+  }
+  if (orderedLoop.every((vid) => uvByVert.has(vid))) {
+    face.uvs = orderedLoop.map((vid) => [...uvByVert.get(vid)!] as Vec2);
+  }
+
+  mesh.clearCustomNormals();
+  mesh.rebuildIndices();
   nextSelected.add(face.id);
 
   return {
@@ -3164,4 +3266,31 @@ meshOperatorRegistry.register({
       slide: Number(params.slide ?? 0),
     }).result;
   },
+});
+
+meshOperatorRegistry.register({
+  id: 'dissolve_limited',
+  label: 'Limited Dissolve',
+  canExecute: (ctx: MeshOperatorContext) => ctx.mesh.faces.length > 0,
+  execute: (ctx: MeshOperatorContext, params = {}) =>
+    limitedDissolveMesh(ctx.mesh, ctx.selectionMode, ctx.selectedIds, {
+      maxAngleDeg: Number(params.maxAngleDeg ?? 5),
+      dissolveVertices: params.dissolveVertices !== false,
+      scope:
+        (params.scope as 'selection' | 'all' | undefined) ??
+        (ctx.selectedIds.size > 0 ? 'selection' : 'all'),
+    }).result,
+});
+
+meshOperatorRegistry.register({
+  id: 'bridge_loops',
+  label: 'Bridge Edge Loops',
+  canExecute: (ctx: MeshOperatorContext) => ctx.selectedIds.size >= 2,
+  execute: (ctx: MeshOperatorContext, params = {}) =>
+    bridgeEdgeLoopsMesh(ctx.mesh, ctx.selectionMode, ctx.selectedIds, {
+      segments: Number(params.segments ?? 1),
+      smoothness: Number(params.smoothness ?? 0),
+      twistOffset: Number(params.twistOffset ?? 0),
+      reverseOrder: Boolean(params.reverseOrder ?? false),
+    }).result,
 });

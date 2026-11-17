@@ -5,18 +5,27 @@ import {
   TouchModifierBehaviorMode,
   TouchModifierKey,
   TouchModifierState,
+  TransformTool,
 } from '../core/project/types';
+import type { ModalGMode } from '../state/useModelerStore';
 
 interface FloatingModifierPanelProps {
   containerRef: React.RefObject<HTMLDivElement | null>;
   settings: TouchControlSettings;
   effectiveModifiers: TouchModifierState;
   virtualModifiers: TouchModifierState;
+  activeTool?: TransformTool;
+  modalTransformMode?: ModalGMode | null;
   onSetModifier: (key: TouchModifierKey, active: boolean) => void;
   onToggleModifier: (key: TouchModifierKey) => void;
   onReleaseAll: () => void;
   onChangeBehaviorMode: (mode: TouchModifierBehaviorMode) => void;
+  onGQuickTapMove?: () => void;
+  onGHoldSlide?: () => void;
 }
+
+const HOLD_G_MS = 400;
+const HOLD_G_MOVE_CANCEL_PX = 22;
 
 const SESSION_POS_KEY = 'forma3d_modifier_panel_pos_v1';
 
@@ -67,21 +76,21 @@ const MODIFIER_BUTTON_META: {
     label: 'SHIFT',
     activeClass: 'bg-[#2a1f10] border-[#ff9900] text-[#ffb84d] shadow-[0_0_10px_rgba(255,153,0,0.22)]',
     dotClass: 'bg-[#ff9900]',
-    title: 'SHIFT: Selección múltiple/aditiva, Caja aditiva y atajos combinados (Shift+O, Ctrl+Shift+Z)',
+    title: 'SHIFT: Selección múltiple/aditiva, Caja aditiva, Ctrl+Shift (Primitivas) y atajos (Shift+O, Ctrl+Shift+Z)',
   },
   {
     key: 'ctrl',
     label: 'CTRL',
     activeClass: 'bg-[#122536] border-[#38bdf8] text-[#7dd3fc] shadow-[0_0_10px_rgba(56,189,248,0.22)]',
     dotClass: 'bg-[#38bdf8]',
-    title: 'CTRL: Modificador virtual CTRL para atajos combinados (Ctrl+Z, Ctrl+Shift+Z, Ctrl+S)',
+    title: 'CTRL + arrastre: Rotación trackball. Combos: Ctrl+Shift (Primitivas), Ctrl+Alt (Operaciones especiales), Ctrl+Z/S',
   },
   {
     key: 'alt',
     label: 'ALT',
     activeClass: 'bg-[#221936] border-[#a78bfa] text-[#c4b5fd] shadow-[0_0_10px_rgba(167,139,250,0.22)]',
     dotClass: 'bg-[#a78bfa]',
-    title: 'ALT: Modificador virtual ALT para atajos combinados (Alt+A deseleccionar, Alt+O solo conectados)',
+    title: 'ALT + toque en el visor: Alternar Objeto/Edición. Combos: Ctrl+Alt (Operaciones), Alt+A, Alt+O',
   },
 ];
 
@@ -90,18 +99,32 @@ export const FloatingModifierPanel: React.FC<FloatingModifierPanelProps> = ({
   settings,
   effectiveModifiers,
   virtualModifiers,
+  activeTool,
+  modalTransformMode = null,
   onSetModifier,
   onToggleModifier,
   onReleaseAll,
   onChangeBehaviorMode,
+  onGQuickTapMove,
+  onGHoldSlide,
 }) => {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const [viewportSize, setViewportSize] = useState({ width: 800, height: 600 });
-  const [panelSize, setPanelSize] = useState({ width: 76, height: 186 });
+  const [panelSize, setPanelSize] = useState({ width: 76, height: 242 });
   const [savedPosPct, setSavedPosPct] = useState<PanelPosPct | null>(() =>
     loadSessionPanelPos(),
   );
   const [dragPos, setDragPos] = useState<{ x: number; y: number } | null>(null);
+  const [gHolding, setGHolding] = useState(false);
+
+  const gPressRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    holdTriggered: boolean;
+    cancelled: boolean;
+    timerId: number | null;
+  } | null>(null);
 
   const dragRef = useRef<{
     pointerId: number;
@@ -149,7 +172,15 @@ export const FloatingModifierPanel: React.FC<FloatingModifierPanelProps> = ({
     return () => ro.disconnect();
   }, []);
 
-  // Release any momentary held modifiers if window loses focus, panel unmounts, or mode changes
+  const clearGPressTimer = () => {
+    const p = gPressRef.current;
+    if (p && p.timerId !== null) {
+      window.clearTimeout(p.timerId);
+      p.timerId = null;
+    }
+  };
+
+  // Release any momentary held modifiers or G timer if window loses focus, tab hides, panel unmounts, or mode changes
   useEffect(() => {
     const releaseHeldPointers = () => {
       const held = heldPointersRef.current;
@@ -159,14 +190,37 @@ export const FloatingModifierPanel: React.FC<FloatingModifierPanelProps> = ({
           onSetModifier(k, false);
         }
       });
+      if (gPressRef.current) {
+        clearGPressTimer();
+        gPressRef.current.cancelled = true;
+        gPressRef.current = null;
+        setGHolding(false);
+      }
+    };
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        releaseHeldPointers();
+      }
     };
 
     window.addEventListener('blur', releaseHeldPointers);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       window.removeEventListener('blur', releaseHeldPointers);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       releaseHeldPointers();
     };
   }, [behaviorMode, onSetModifier]);
+
+  // Clear stale held pointer tracking if virtual modifiers were released externally
+  useEffect(() => {
+    const held = heldPointersRef.current;
+    (['shift', 'ctrl', 'alt'] as TouchModifierKey[]).forEach((k) => {
+      if (!virtualModifiers[k] && held[k].size > 0) {
+        held[k].clear();
+      }
+    });
+  }, [virtualModifiers]);
 
   const visibleButtons = useMemo(
     () =>
@@ -189,8 +243,9 @@ export const FloatingModifierPanel: React.FC<FloatingModifierPanelProps> = ({
     virtualModifiers.shift || virtualModifiers.ctrl || virtualModifiers.alt;
 
   const isVisible =
-    (settings.modifierPanelEnabled && visibleButtons.length > 0) ||
-    activeKeys.length > 0;
+    settings.modifierPanelEnabled ||
+    activeKeys.length > 0 ||
+    Boolean(modalTransformMode);
 
   const panelPos = useMemo(() => {
     const pad = 12;
@@ -323,6 +378,103 @@ export const FloatingModifierPanel: React.FC<FloatingModifierPanelProps> = ({
     }
   };
 
+  const handleGPointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    e.preventDefault();
+
+    clearGPressTimer();
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore synthetic capture error
+    }
+
+    const pointerId = e.pointerId;
+    const pressState = {
+      pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      holdTriggered: false,
+      cancelled: false,
+      timerId: null as number | null,
+    };
+    gPressRef.current = pressState;
+    setGHolding(true);
+
+    pressState.timerId = window.setTimeout(() => {
+      const curr = gPressRef.current;
+      if (!curr || curr.pointerId !== pointerId || curr.cancelled) return;
+      curr.timerId = null;
+      curr.holdTriggered = true;
+      setGHolding(false);
+      onGHoldSlide?.();
+    }, HOLD_G_MS);
+  };
+
+  const handleGPointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    const curr = gPressRef.current;
+    if (!curr || curr.pointerId !== e.pointerId || curr.holdTriggered || curr.cancelled) {
+      return;
+    }
+    if (Math.hypot(e.clientX - curr.startX, e.clientY - curr.startY) > HOLD_G_MOVE_CANCEL_PX) {
+      clearGPressTimer();
+      curr.cancelled = true;
+      setGHolding(false);
+    }
+  };
+
+  const handleGPointerUp = (e: React.PointerEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // Ignore
+    }
+    clearGPressTimer();
+    const curr = gPressRef.current;
+    gPressRef.current = null;
+    setGHolding(false);
+    if (curr && curr.pointerId === e.pointerId && !curr.cancelled && !curr.holdTriggered) {
+      onGQuickTapMove?.();
+    }
+  };
+
+  const handleGPointerCancel = (e: React.PointerEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // Ignore
+    }
+    clearGPressTimer();
+    if (gPressRef.current && gPressRef.current.pointerId === e.pointerId) {
+      gPressRef.current.cancelled = true;
+      gPressRef.current = null;
+    }
+    setGHolding(false);
+  };
+
+  const isSlideModalActive =
+    modalTransformMode === 'vertex_slide' || modalTransformMode === 'edge_slide';
+  const isMoveModalActive = modalTransformMode === 'move';
+  const isMoveToolHighlighted =
+    isMoveModalActive || (!isSlideModalActive && activeTool === 'move');
+
+  const gBadgeText =
+    modalTransformMode === 'vertex_slide'
+      ? 'V·SLD'
+      : modalTransformMode === 'edge_slide'
+        ? 'E·SLD'
+        : isMoveModalActive
+          ? 'MOVER'
+          : 'MV/SL';
+
   return (
     <div
       ref={panelRef}
@@ -430,6 +582,63 @@ export const FloatingModifierPanel: React.FC<FloatingModifierPanelProps> = ({
         </div>
       )}
 
+      {/* Quick-Tap Move / Hold Slide Button (G) */}
+      {onGQuickTapMove && settings.modifierPanelEnabled && (
+        <div className="pt-1 border-t border-[#292d36]">
+          <button
+            type="button"
+            data-testid="floating-g-button"
+            aria-pressed={isMoveToolHighlighted || isSlideModalActive}
+            title="G — Toque rápido: Mover · Mantener 400 ms: Vertex/Edge Slide"
+            style={{ touchAction: 'none' }}
+            onPointerDown={handleGPointerDown}
+            onPointerMove={handleGPointerMove}
+            onPointerUp={handleGPointerUp}
+            onPointerCancel={handleGPointerCancel}
+            onLostPointerCapture={handleGPointerCancel}
+            onClick={(e) => {
+              e.stopPropagation();
+              // Keyboard Enter/Space activation fallback only (pointer uses down/up timing)
+              if (e.detail === 0) {
+                onGQuickTapMove();
+              }
+            }}
+            className={`relative overflow-hidden w-full h-11 px-2 rounded-lg border flex items-center justify-between transition-colors ${
+              isSlideModalActive
+                ? 'bg-[#0e2a33] border-[#22d3ee] text-[#67e8f9] shadow-[0_0_12px_rgba(34,211,238,0.28)]'
+                : isMoveModalActive
+                  ? 'bg-[#2c1f0e] border-[#ff9900] text-[#ffb84d] shadow-[0_0_12px_rgba(255,153,0,0.28)]'
+                  : isMoveToolHighlighted
+                    ? 'bg-[#231d15] border-[#b47420] text-[#f5c77e]'
+                    : 'bg-[#20232a] border-[#323744] text-[#b4bac4] hover:text-white hover:border-[#454c5c]'
+            }`}
+          >
+            <div className="flex flex-col items-start leading-none">
+              <span className="text-xs font-extrabold tracking-wide">G</span>
+              <span className="text-[8px] font-semibold tracking-tight opacity-85 mt-0.5">
+                {gBadgeText}
+              </span>
+            </div>
+            <span
+              className={`w-2 h-2 rounded-full transition-opacity ${
+                isSlideModalActive
+                  ? 'bg-[#22d3ee] opacity-100'
+                  : isMoveModalActive
+                    ? 'bg-[#ff9900] opacity-100'
+                    : isMoveToolHighlighted
+                      ? 'bg-[#ff9900] opacity-70'
+                      : 'bg-[#4b5262] opacity-55'
+              }`}
+            />
+            {gHolding && (
+              <span
+                className="absolute bottom-0 left-0 h-0.5 bg-[#22d3ee] animate-[pulse_0.4s_ease-in-out_infinite] w-full"
+              />
+            )}
+          </button>
+        </div>
+      )}
+
       {/* Active Combination Indicator (shows multi-modifier combos or gesture-only SHIFT) */}
       {activeKeys.length > 0 && (
         <div className="flex items-center justify-between gap-1 px-1 py-0.5 rounded bg-[#14161b] border border-[#2a2f3a]">
@@ -461,3 +670,4 @@ export const FloatingModifierPanel: React.FC<FloatingModifierPanelProps> = ({
     </div>
   );
 };
+

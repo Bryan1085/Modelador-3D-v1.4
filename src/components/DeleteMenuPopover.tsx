@@ -1,11 +1,12 @@
 import React from 'react';
-import { Trash2, X } from 'lucide-react';
+import { ScissorsLineDashed, Trash2, X } from 'lucide-react';
 import { DeleteActionType } from '../core/mesh/advancedOperations';
 import { EditSelectionMode } from '../core/mesh/operations';
 
 interface DeleteMenuPopoverProps {
   editSelectionMode: EditSelectionMode;
   onSelectAction: (action: DeleteActionType) => void;
+  onLimitedDissolve?: () => void;
   onClose: () => void;
 }
 
@@ -64,6 +65,7 @@ const OPTIONS_BY_MODE: Record<
 export const DeleteMenuPopover: React.FC<DeleteMenuPopoverProps> = ({
   editSelectionMode,
   onSelectAction,
+  onLimitedDissolve,
   onClose,
 }) => {
   const options = OPTIONS_BY_MODE[editSelectionMode];
@@ -110,6 +112,25 @@ export const DeleteMenuPopover: React.FC<DeleteMenuPopoverProps> = ({
             </span>
           </button>
         ))}
+
+        {onLimitedDissolve && (
+          <button
+            type="button"
+            onClick={() => {
+              onLimitedDissolve();
+              onClose();
+            }}
+            className="w-full min-h-[44px] px-2.5 py-2 rounded-md text-left hover:bg-[#262a33] active:bg-[#2f3440] border-t border-[#282c35] transition-colors flex flex-col justify-center gap-0.5"
+          >
+            <span className="text-xs font-semibold text-[#7dd3fc] flex items-center gap-1.5">
+              <ScissorsLineDashed className="w-3.5 h-3.5" />
+              <span>Limited Dissolve</span>
+            </span>
+            <span className="text-[10px] text-[#9ca3af] leading-tight">
+              Simplifica caras y vértices según ángulo límite
+            </span>
+          </button>
+        )}
       </div>
     </div>
   );

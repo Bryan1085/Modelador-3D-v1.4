@@ -24,6 +24,15 @@ import {
   sampleProportionalWeightColor,
 } from '../core/mesh/proportionalEditing';
 import {
+  applyEdgeSlide,
+  applyVertexSlideFromScreenSelections,
+  buildEdgeSlidePlan,
+  buildVertexSlidePlan,
+  EdgeSlidePlan,
+  VertexSlidePlan,
+  VertexSlideSelection,
+} from '../core/mesh/slideTools';
+import {
   AxisConstraint,
   CameraProjection,
   ModelerSettings,
@@ -112,6 +121,16 @@ export interface BoxSelectOverlayState {
   additive: boolean;
 }
 
+export type ModalGMode = 'move' | 'vertex_slide' | 'edge_slide';
+
+export interface ModalTransformStatus {
+  active: boolean;
+  mode: ModalGMode;
+  label: string;
+  deltaText: string;
+  clamped?: boolean;
+}
+
 export interface ViewportCallbacks {
   onSelectObject: (id: string | null, additive?: boolean) => void;
   onBoxSelectObjects?: (ids: string[], additive: boolean) => void;
@@ -127,6 +146,10 @@ export interface ViewportCallbacks {
   onThreeFingerRedo: () => void;
   onOpenContextMenu: (info: ViewportContextInfo) => void;
   onModifierStateChange?: (modifiers: TouchModifierState) => void;
+  onAltTap?: () => void;
+  onTrackballActiveChange?: (active: boolean) => void;
+  onModalTransformStatusChange?: (status: ModalTransformStatus | null) => void;
+  onCompleteModalTransform?: (committed: boolean) => void;
   onCameraPoseChange?: (quaternion: CameraQuaternionTuple) => void;
   onLiveObjectTransform: (id: string, transform: ObjectTransform) => void;
   onCommitObjectTransform: (
@@ -172,11 +195,22 @@ interface ObjectVisual {
 const _v0 = new THREE.Vector3();
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
+const _tbVecCurr = new THREE.Vector3();
+const _tbAxis = new THREE.Vector3();
+const _zeroVec = new THREE.Vector3(0, 0, 0);
+const _oneVec = new THREE.Vector3(1, 1, 1);
 const _mat4A = new THREE.Matrix4();
 const _mat4B = new THREE.Matrix4();
 const _mat4C = new THREE.Matrix4();
 const _quat = new THREE.Quaternion();
+const _tbQuat = new THREE.Quaternion();
+const _tbQuatStart = new THREE.Quaternion();
 const _euler = new THREE.Euler();
+const _modalRayHit = new THREE.Vector3();
+const _modalCurrPoint = new THREE.Vector3();
+const _modalDelta = new THREE.Vector3();
+const _modalCamRight = new THREE.Vector3();
+const _modalCamUp = new THREE.Vector3();
 
 function detectSoftwareWebGL(): boolean {
   try {
@@ -252,7 +286,6 @@ export class ViewportEngine {
 
   private gridHelper: THREE.GridHelper;
   private axesGroup: THREE.Group;
-  private shadowPlane: THREE.Mesh;
 
   private objectsGroup = new THREE.Group();
   private visuals = new Map<string, ObjectVisual>();
@@ -261,12 +294,14 @@ export class ViewportEngine {
   private editOverlayGroup = new THREE.Group();
   private editAllEdgesLine: THREE.LineSegments;
   private editSelectedEdgesLine: THREE.LineSegments;
+  private slideGuideLines: THREE.LineSegments;
   private editSelectedEdgeBars: THREE.InstancedMesh;
   private loopCutPreviewBars: THREE.InstancedMesh;
   private loopCutPreviewPoints: THREE.Points;
   private editSelectedFacesMesh: THREE.Mesh;
   private editUnselectedVerticesPoints: THREE.Points;
   private editSelectedVerticesPoints: THREE.Points;
+  private mergeCursorMarker: THREE.LineSegments;
   private proportionalRing: THREE.LineLoop;
   private proportionalRingVisible = false;
   private vertexDotTexture: THREE.CanvasTexture;
@@ -309,6 +344,31 @@ export class ViewportEngine {
 
   // Drag tracking
   private isGizmoDragging = false;
+  private isTrackballDragging = false;
+  private trackballMoved = false;
+  private trackballStartVec = new THREE.Vector3();
+  private trackballStartQuat = new THREE.Quaternion();
+  private trackballDeltaQuat = new THREE.Quaternion();
+  private modalTransformMode: ModalGMode | null = null;
+  private modalSlideClamp = true;
+  private modalCancelNonce = 0;
+  private isModalDragging = false;
+  private modalMoved = false;
+  private modalStartX = 0;
+  private modalStartY = 0;
+  private modalStartObjPos = new THREE.Vector3();
+  private modalDragPlane = new THREE.Plane();
+  private modalDragStartPointWorld = new THREE.Vector3();
+  private modalAxisDirWorld = new THREE.Vector3();
+  private modalLastDeltaWorld = new THREE.Vector3();
+  private modalVertexSlidePlan: VertexSlidePlan | null = null;
+  private modalEdgeSlidePlan: EdgeSlidePlan | null = null;
+  private modalEdgeSlideAxis2D: {
+    dirX: number;
+    dirY: number;
+    lenPosPx: number;
+    lenNegPx: number;
+  } | null = null;
   private objectDragStartTransform: ObjectTransform | null = null;
   private editDragStartMesh: EditableMesh | null = null;
   private editDragStartVertexIds = new Set<string>();
@@ -358,8 +418,7 @@ export class ViewportEngine {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.05;
-    this.renderer.shadowMap.enabled = !this.isSoftwareGl;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.enabled = false;
     this.renderer.domElement.style.display = 'block';
     this.renderer.domElement.style.width = '100%';
     this.renderer.domElement.style.height = '100%';
@@ -400,34 +459,12 @@ export class ViewportEngine {
 
     const keyLight = new THREE.DirectionalLight(0xfff5e8, 1.45);
     keyLight.position.set(7, -8, 12);
-    keyLight.castShadow = !this.isSoftwareGl;
-    keyLight.shadow.mapSize.set(1024, 1024);
-    keyLight.shadow.camera.left = -10;
-    keyLight.shadow.camera.right = 10;
-    keyLight.shadow.camera.top = 10;
-    keyLight.shadow.camera.bottom = -10;
-    keyLight.shadow.camera.near = 1;
-    keyLight.shadow.camera.far = 40;
-    keyLight.shadow.bias = -0.0005;
-    keyLight.shadow.normalBias = 0.02;
+    keyLight.castShadow = false;
     this.scene.add(keyLight);
 
     const rimLight = new THREE.DirectionalLight(0xc2d4ff, 0.55);
     rimLight.position.set(-8, 7, 6);
     this.scene.add(rimLight);
-
-    // Subtle ground shadow receiver on XY plane (Z-up floor)
-    const shadowMat = new THREE.ShadowMaterial({ opacity: 0.22 });
-    shadowMat.depthTest = true;
-    shadowMat.depthWrite = false;
-    this.shadowPlane = new THREE.Mesh(
-      new THREE.PlaneGeometry(60, 60),
-      shadowMat,
-    );
-    this.shadowPlane.position.set(0, 0, -0.004);
-    this.shadowPlane.receiveShadow = true;
-    this.shadowPlane.renderOrder = -3;
-    this.scene.add(this.shadowPlane);
 
     // Reference Grid rotated onto XY plane (Z = 0) — visual guide only, never writes depth
     this.gridHelper = new THREE.GridHelper(32, 32, 0x3f444f, 0x2a2d35);
@@ -559,15 +596,52 @@ export class ViewportEngine {
     this.loopCutPreviewPoints.frustumCulled = false;
     this.loopCutPreviewPoints.renderOrder = 9;
 
+    const cursorSize = 0.22;
+    const cursorGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-cursorSize, 0, 0),
+      new THREE.Vector3(cursorSize, 0, 0),
+      new THREE.Vector3(0, -cursorSize, 0),
+      new THREE.Vector3(0, cursorSize, 0),
+      new THREE.Vector3(0, 0, -cursorSize),
+      new THREE.Vector3(0, 0, cursorSize),
+    ]);
+    this.mergeCursorMarker = new THREE.LineSegments(
+      cursorGeo,
+      new THREE.LineBasicMaterial({
+        color: 0xff5555,
+        depthTest: false,
+        depthWrite: false,
+      }),
+    );
+    this.mergeCursorMarker.visible = false;
+    this.mergeCursorMarker.frustumCulled = false;
+    this.mergeCursorMarker.renderOrder = 10;
+
+    this.slideGuideLines = new THREE.LineSegments(
+      new THREE.BufferGeometry(),
+      new THREE.LineBasicMaterial({
+        color: 0x22d3ee,
+        transparent: true,
+        opacity: 0.9,
+        depthTest: false,
+        depthWrite: false,
+      }),
+    );
+    this.slideGuideLines.visible = false;
+    this.slideGuideLines.frustumCulled = false;
+    this.slideGuideLines.renderOrder = 8;
+
     this.editOverlayGroup.add(
       this.editSelectedFacesMesh,
       this.editAllEdgesLine,
       this.editSelectedEdgesLine,
+      this.slideGuideLines,
       this.editSelectedEdgeBars,
       this.loopCutPreviewBars,
       this.loopCutPreviewPoints,
       this.editUnselectedVerticesPoints,
       this.editSelectedVerticesPoints,
+      this.mergeCursorMarker,
     );
     this.editOverlayGroup.visible = false;
     this.scene.add(this.editOverlayGroup);
@@ -612,10 +686,20 @@ export class ViewportEngine {
       const dragging = Boolean(event.value);
       this.isGizmoDragging = dragging;
       if (dragging) {
+        if (this.isTrackballDragging) {
+          this.cancelTrackballRotate();
+        }
+        if (this.isModalDragging) {
+          this.cancelModalTransform();
+        }
         this.gestureManager.invalidateCurrentGesture();
       }
       this.orbitControls.enabled =
-        !dragging && !this.suppressOrbitForContextPress && !this.isBoxSelectBlocking;
+        !dragging &&
+        !this.isTrackballDragging &&
+        !this.isModalDragging &&
+        !this.suppressOrbitForContextPress &&
+        !this.isBoxSelectBlocking;
       if (dragging) {
         this.handleGizmoDragStart();
       } else {
@@ -641,6 +725,9 @@ export class ViewportEngine {
       isBoxSelectDisabled: () => this.loopCutPreviewMode,
       isShiftHoldDisabled: () =>
         this.loopCutPreviewMode && this.loopCutSlideActive,
+      isTrackballDisabled: () =>
+        this.loopCutPreviewMode || this.suppressGizmo,
+      canTrackballRotate: () => this.canTrackballRotate(),
       getWorkMode: () => this.workMode,
       hasLongPressTarget: (clientX, clientY, pointerType) =>
         this.workMode === 'object'
@@ -658,6 +745,9 @@ export class ViewportEngine {
           additive,
           false,
         );
+      },
+      onAltTap: () => {
+        this.callbacks.onAltTap?.();
       },
       onTwoFingerTap: () => {
         if (!this.loopCutPreviewMode) {
@@ -683,6 +773,31 @@ export class ViewportEngine {
       },
       onBoxSelectCancel: () => {
         this.clearBoxSelectPreview();
+      },
+      onTrackballRotateStart: (clientX, clientY) => {
+        this.startTrackballRotate(clientX, clientY);
+      },
+      onTrackballRotateMove: (clientX, clientY) => {
+        this.updateTrackballRotate(clientX, clientY);
+      },
+      onTrackballRotateEnd: () => {
+        this.endTrackballRotate();
+      },
+      onTrackballRotateCancel: () => {
+        this.cancelTrackballRotate();
+      },
+      isModalTransformArmed: () => this.canStartModalTransform(),
+      onModalTransformStart: (clientX, clientY) => {
+        this.startModalTransform(clientX, clientY);
+      },
+      onModalTransformMove: (clientX, clientY) => {
+        this.updateModalTransform(clientX, clientY);
+      },
+      onModalTransformEnd: () => {
+        this.endModalTransform();
+      },
+      onModalTransformCancel: () => {
+        this.cancelModalTransform();
       },
       onModifierStateChange: (modifiers) => {
         this.callbacks.onModifierStateChange?.(modifiers);
@@ -778,9 +893,17 @@ export class ViewportEngine {
     e.preventDefault();
   };
 
+  private isAnyTransformDragging(): boolean {
+    return (
+      this.isGizmoDragging ||
+      this.isTrackballDragging ||
+      this.isModalDragging
+    );
+  }
+
   private onViewportWheel = (e: WheelEvent) => {
     if (
-      !this.isGizmoDragging ||
+      !this.isAnyTransformDragging() ||
       this.workMode !== 'edit' ||
       !this.proportionalSettings.enabled
     ) {
@@ -798,7 +921,21 @@ export class ViewportEngine {
         radius: nextRadius,
       };
       this.refreshProportionalDragWeights(false);
-      this.handleGizmoObjectChange();
+      if (this.isTrackballDragging && this.selectedObjectId) {
+        const visual = this.visuals.get(this.selectedObjectId);
+        if (visual) this.applyTrackballEditMesh(visual);
+      } else if (
+        this.isModalDragging &&
+        this.modalTransformMode === 'move' &&
+        this.selectedObjectId
+      ) {
+        const visual = this.visuals.get(this.selectedObjectId);
+        if (visual) {
+          this.applyModalMoveEditMesh(visual, this.modalLastDeltaWorld);
+        }
+      } else {
+        this.handleGizmoObjectChange();
+      }
       this.callbacks.onChangeProportionalRadius?.(nextRadius);
       this.requestRender();
     }
@@ -841,8 +978,13 @@ export class ViewportEngine {
     isBoxSelectBlocking = false,
   ): void {
     this.isBoxSelectBlocking = isBoxSelectBlocking;
-    if (isBoxSelectBlocking || modifiers.shift) {
-      // Lock camera navigation while Double-Tap Box Select or touch SHIFT hold is active
+    if (
+      isBoxSelectBlocking ||
+      modifiers.shift ||
+      this.isTrackballDragging ||
+      this.isModalDragging
+    ) {
+      // Lock camera navigation while Double-Tap Box Select, CTRL Trackball, G Modal Drag, or touch SHIFT hold is active
       this.orbitControls.enabled = false;
       this.orbitControls.enableRotate = false;
       return;
@@ -851,7 +993,7 @@ export class ViewportEngine {
     if (activePointers.size === 0) {
       this.suppressOrbitForContextPress = false;
       this.loopCutSlidePointerId = null;
-      this.orbitControls.enabled = !this.isGizmoDragging;
+      this.orbitControls.enabled = !this.isAnyTransformDragging();
       this.orbitControls.enableRotate = !(
         this.loopCutPreviewMode && this.loopCutSlideActive
       );
@@ -879,7 +1021,7 @@ export class ViewportEngine {
       (p) => p.pointerType === 'touch',
     );
     if (!hasTouch) {
-      this.orbitControls.enabled = !this.isGizmoDragging;
+      this.orbitControls.enabled = !this.isAnyTransformDragging();
       this.orbitControls.enableRotate = !slideBlockingOrbit;
       this.orbitControls.enableZoom = true;
       this.orbitControls.enablePan = true;
@@ -889,7 +1031,7 @@ export class ViewportEngine {
     this.orbitControls.enableRotate = !slideBlockingOrbit && touchCfg.oneFingerOrbit;
     this.orbitControls.enableZoom = touchCfg.twoFingerPinchZoom;
     this.orbitControls.enablePan = touchCfg.twoFingerPan;
-    this.orbitControls.enabled = !this.isGizmoDragging;
+    this.orbitControls.enabled = !this.isAnyTransformDragging();
   }
 
   private handleLongPressContext(
@@ -1653,6 +1795,106 @@ export class ViewportEngine {
     return this.proportionalPreviewWeights;
   }
 
+  private syncLiveObjectTransformAndMirrors(
+    objectId: string,
+    liveTransform: ObjectTransform,
+  ): void {
+    this.callbacks.onLiveObjectTransform(objectId, liveTransform);
+
+    // Update any scene objects referencing this object as a Mirror Object live
+    this.sceneTransformRefs = this.sceneTransformRefs.map((ref) =>
+      ref.id === objectId
+        ? {
+            id: ref.id,
+            position: liveTransform.position,
+            rotation: liveTransform.rotation,
+            scale: liveTransform.scale,
+          }
+        : ref,
+    );
+    for (const other of this.visuals.values()) {
+      if (!other.modifiers || other.modifiers.length === 0) continue;
+      const refsDragged = other.modifiers.some(
+        (m) =>
+          m.enabled &&
+          m.type === 'mirror' &&
+          normalizeMirrorParams(m.params).mirrorObjectId === objectId,
+      );
+      if (!refsDragged) continue;
+      const ownerObj = this.currentObjectsData.get(other.id);
+      if (!ownerObj) continue;
+      const ownerRef: ModifierTransformRef = {
+        id: ownerObj.id,
+        position:
+          ownerObj.id === objectId
+            ? liveTransform.position
+            : ownerObj.transform.position,
+        rotation:
+          ownerObj.id === objectId
+            ? liveTransform.rotation
+            : ownerObj.transform.rotation,
+        scale:
+          ownerObj.id === objectId
+            ? liveTransform.scale
+            : ownerObj.transform.scale,
+      };
+      const evalRes = evaluateObjectModifiers(ownerObj.mesh, other.modifiers, {
+        ownerTransform: ownerRef,
+        sceneTransformRefs: this.sceneTransformRefs,
+      });
+      other.hasActiveModifiers = evalRes.hasActiveModifiers;
+      other.editableMesh = evalRes.hasActiveModifiers
+        ? EditableMesh.fromJSON(evalRes.mesh)
+        : other.baseEditableMesh;
+      this.rebuildObjectGeometry(other);
+    }
+  }
+
+  private commitEditedMeshToVisual(
+    visual: ObjectVisual,
+    nextMesh: EditableMesh,
+    affectedVertexIds: Set<string>,
+  ): void {
+    const ownerObj = this.currentObjectsData.get(visual.id);
+    const ownerRef: ModifierTransformRef | undefined = ownerObj
+      ? {
+          id: ownerObj.id,
+          position: ownerObj.transform.position,
+          rotation: ownerObj.transform.rotation,
+          scale: ownerObj.transform.scale,
+        }
+      : undefined;
+
+    if (visual.modifiers.length > 0) {
+      clampVerticesForMirrorClipping(
+        nextMesh,
+        affectedVertexIds,
+        this.editDragStartVertexPositions,
+        visual.modifiers,
+        ownerRef,
+        this.sceneTransformRefs,
+      );
+    }
+
+    visual.baseEditableMesh = nextMesh;
+    if (hasActiveViewportModifiers(visual.modifiers)) {
+      const evalRes = evaluateObjectModifiers(nextMesh.toJSON(), visual.modifiers, {
+        ownerTransform: ownerRef,
+        sceneTransformRefs: this.sceneTransformRefs,
+      });
+      visual.hasActiveModifiers = evalRes.hasActiveModifiers;
+      visual.editableMesh = evalRes.hasActiveModifiers
+        ? EditableMesh.fromJSON(evalRes.mesh)
+        : nextMesh;
+    } else {
+      visual.hasActiveModifiers = false;
+      visual.editableMesh = nextMesh;
+    }
+    visual.lastMeshData = null;
+    this.rebuildObjectGeometry(visual);
+    this.syncEditModeOverlays();
+  }
+
   private handleGizmoObjectChange(): void {
     if (!this.isGizmoDragging || !this.selectedObjectId) return;
     const visual = this.visuals.get(this.selectedObjectId);
@@ -1665,56 +1907,7 @@ export class ViewportEngine {
         rotation: [g.rotation.x, g.rotation.y, g.rotation.z],
         scale: [g.scale.x, g.scale.y, g.scale.z],
       };
-      this.callbacks.onLiveObjectTransform(this.selectedObjectId, liveTransform);
-
-      // Update any scene objects referencing this object as a Mirror Object live
-      this.sceneTransformRefs = this.sceneTransformRefs.map((ref) =>
-        ref.id === this.selectedObjectId
-          ? {
-              id: ref.id,
-              position: liveTransform.position,
-              rotation: liveTransform.rotation,
-              scale: liveTransform.scale,
-            }
-          : ref,
-      );
-      for (const other of this.visuals.values()) {
-        if (!other.modifiers || other.modifiers.length === 0) continue;
-        const refsDragged = other.modifiers.some(
-          (m) =>
-            m.enabled &&
-            m.type === 'mirror' &&
-            normalizeMirrorParams(m.params).mirrorObjectId ===
-              this.selectedObjectId,
-        );
-        if (!refsDragged) continue;
-        const ownerObj = this.currentObjectsData.get(other.id);
-        if (!ownerObj) continue;
-        const ownerRef: ModifierTransformRef = {
-          id: ownerObj.id,
-          position:
-            ownerObj.id === this.selectedObjectId
-              ? liveTransform.position
-              : ownerObj.transform.position,
-          rotation:
-            ownerObj.id === this.selectedObjectId
-              ? liveTransform.rotation
-              : ownerObj.transform.rotation,
-          scale:
-            ownerObj.id === this.selectedObjectId
-              ? liveTransform.scale
-              : ownerObj.transform.scale,
-        };
-        const evalRes = evaluateObjectModifiers(ownerObj.mesh, other.modifiers, {
-          ownerTransform: ownerRef,
-          sceneTransformRefs: this.sceneTransformRefs,
-        });
-        other.hasActiveModifiers = evalRes.hasActiveModifiers;
-        other.editableMesh = evalRes.hasActiveModifiers
-          ? EditableMesh.fromJSON(evalRes.mesh)
-          : other.baseEditableMesh;
-        this.rebuildObjectGeometry(other);
-      }
+      this.syncLiveObjectTransformAndMirrors(this.selectedObjectId, liveTransform);
     } else if (this.editDragStartMesh) {
       // Recompute baseEditableMesh from dragStartMesh using delta matrix
       const nextMesh = this.editDragStartMesh.clone();
@@ -1761,44 +1954,7 @@ export class ViewportEngine {
         affectedVertexIds = this.editDragStartVertexIds;
       }
 
-      const ownerObj = this.currentObjectsData.get(visual.id);
-      const ownerRef: ModifierTransformRef | undefined = ownerObj
-        ? {
-            id: ownerObj.id,
-            position: ownerObj.transform.position,
-            rotation: ownerObj.transform.rotation,
-            scale: ownerObj.transform.scale,
-          }
-        : undefined;
-
-      if (visual.modifiers.length > 0) {
-        clampVerticesForMirrorClipping(
-          nextMesh,
-          affectedVertexIds,
-          this.editDragStartVertexPositions,
-          visual.modifiers,
-          ownerRef,
-          this.sceneTransformRefs,
-        );
-      }
-
-      visual.baseEditableMesh = nextMesh;
-      if (hasActiveViewportModifiers(visual.modifiers)) {
-        const evalRes = evaluateObjectModifiers(nextMesh.toJSON(), visual.modifiers, {
-          ownerTransform: ownerRef,
-          sceneTransformRefs: this.sceneTransformRefs,
-        });
-        visual.hasActiveModifiers = evalRes.hasActiveModifiers;
-        visual.editableMesh = evalRes.hasActiveModifiers
-          ? EditableMesh.fromJSON(evalRes.mesh)
-          : nextMesh;
-      } else {
-        visual.hasActiveModifiers = false;
-        visual.editableMesh = nextMesh;
-      }
-      visual.lastMeshData = null;
-      this.rebuildObjectGeometry(visual);
-      this.syncEditModeOverlays();
+      this.commitEditedMeshToVisual(visual, nextMesh, affectedVertexIds);
     }
   }
 
@@ -1831,6 +1987,863 @@ export class ViewportEngine {
       this.callbacks.onCommitMeshEdit(this.selectedObjectId, before, after);
       this.syncGizmoAttachment();
     }
+  }
+
+  private canTrackballRotate(): boolean {
+    if (!this.selectedObjectId || this.loopCutPreviewMode || this.suppressGizmo) {
+      return false;
+    }
+    const visual = this.visuals.get(this.selectedObjectId);
+    if (!visual || !visual.group.visible || visual.locked) return false;
+    if (this.workMode === 'object') return true;
+    const vertIds = visual.baseEditableMesh.getVertexIdsFromSelection(
+      this.editSelectionMode,
+      this.selectedComponentIds,
+    );
+    return vertIds.size > 0;
+  }
+
+  private projectToTrackball(
+    clientX: number,
+    clientY: number,
+    out: THREE.Vector3,
+  ): THREE.Vector3 {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const w = Math.max(1, rect.width);
+    const h = Math.max(1, rect.height);
+    const radius = Math.max(40, Math.min(w, h) * 0.45);
+    const x = (clientX - rect.left - w * 0.5) / radius;
+    const y = -(clientY - rect.top - h * 0.5) / radius;
+    const lenSq = x * x + y * y;
+    const z = lenSq <= 0.5 ? Math.sqrt(1 - lenSq) : 0.5 / Math.sqrt(lenSq);
+    return out
+      .set(x, y, z)
+      .normalize()
+      .applyQuaternion(this.activeCamera.quaternion)
+      .normalize();
+  }
+
+  private applyTrackballEditMesh(visual: ObjectVisual): void {
+    if (!this.editDragStartMesh) return;
+    const nextMesh = this.editDragStartMesh.clone();
+    visual.group.updateMatrixWorld(true);
+    _mat4B.copy(visual.group.matrixWorld).invert();
+
+    let affectedVertexIds: Set<string>;
+    if (this.proportionalSettings.enabled) {
+      this.refreshProportionalDragWeights(false);
+      affectedVertexIds = applyProportionalWorldAnchorTransform(
+        nextMesh,
+        this.editDragStartMesh,
+        this.proportionalDragWeights,
+        {
+          startAnchorWorld: this.editDragStartAnchorPos,
+          deltaPosWorld: _zeroVec,
+          deltaQuatWorld: this.trackballDeltaQuat,
+          deltaScaleWorld: _oneVec,
+          objectMatrixWorld: visual.group.matrixWorld,
+          objectMatrixWorldInv: _mat4B,
+        },
+      );
+    } else {
+      // M_world_delta = T(anchorWorld) * R(deltaQuat) * T(-anchorWorld)
+      _mat4A.compose(this.editDragStartAnchorPos, this.trackballDeltaQuat, _oneVec);
+      _mat4C.makeTranslation(
+        -this.editDragStartAnchorPos.x,
+        -this.editDragStartAnchorPos.y,
+        -this.editDragStartAnchorPos.z,
+      );
+      _mat4A.multiply(_mat4C);
+      _mat4C.multiplyMatrices(_mat4B, _mat4A);
+      _mat4C.multiply(visual.group.matrixWorld);
+      applyTransformToVertices(
+        nextMesh,
+        this.editDragStartVertexIds,
+        _mat4C,
+        [0, 0, 0],
+      );
+      affectedVertexIds = this.editDragStartVertexIds;
+    }
+
+    this.commitEditedMeshToVisual(visual, nextMesh, affectedVertexIds);
+  }
+
+  private startTrackballRotate(startX: number, startY: number): void {
+    if (!this.canTrackballRotate() || !this.selectedObjectId) return;
+    const visual = this.visuals.get(this.selectedObjectId);
+    if (!visual) return;
+
+    this.isTrackballDragging = true;
+    this.trackballMoved = false;
+    this.orbitControls.enabled = false;
+    this.projectToTrackball(startX, startY, this.trackballStartVec);
+    this.trackballDeltaQuat.identity();
+
+    if (this.workMode === 'object') {
+      const g = visual.group;
+      this.objectDragStartTransform = {
+        position: [g.position.x, g.position.y, g.position.z],
+        rotation: [g.rotation.x, g.rotation.y, g.rotation.z],
+        scale: [g.scale.x, g.scale.y, g.scale.z],
+      };
+      this.trackballStartQuat.copy(g.quaternion);
+    } else {
+      this.editDragStartMesh = visual.baseEditableMesh.clone();
+      this.editDragStartVertexIds = visual.baseEditableMesh.getVertexIdsFromSelection(
+        this.editSelectionMode,
+        this.selectedComponentIds,
+      );
+      this.editDragStartVertexPositions.clear();
+      for (const v of this.editDragStartMesh.vertices) {
+        this.editDragStartVertexPositions.set(v.id, [...v.position]);
+      }
+      const centroidLocal = visual.baseEditableMesh.computeCentroid(
+        this.editDragStartVertexIds,
+      );
+      if (!centroidLocal) {
+        this.isTrackballDragging = false;
+        this.editDragStartMesh = null;
+        return;
+      }
+      visual.group.updateMatrixWorld(true);
+      this.editDragStartAnchorPos
+        .set(centroidLocal[0], centroidLocal[1], centroidLocal[2])
+        .applyMatrix4(visual.group.matrixWorld);
+      this.proportionalDragField = null;
+      this.proportionalDragWeights.clear();
+      this.proportionalDragRadiusUsed = -1;
+      this.proportionalDragFalloffUsed = '';
+      this.refreshProportionalDragWeights(true);
+    }
+
+    this.callbacks.onTrackballActiveChange?.(true);
+    this.requestRender();
+  }
+
+  private updateTrackballRotate(clientX: number, clientY: number): void {
+    if (!this.isTrackballDragging || !this.selectedObjectId) return;
+    const visual = this.visuals.get(this.selectedObjectId);
+    if (!visual) return;
+
+    this.projectToTrackball(clientX, clientY, _tbVecCurr);
+    const dot = THREE.MathUtils.clamp(
+      this.trackballStartVec.dot(_tbVecCurr),
+      -1,
+      1,
+    );
+    _tbAxis.crossVectors(this.trackballStartVec, _tbVecCurr);
+    if (_tbAxis.lengthSq() < 1e-10) {
+      this.trackballStartVec.copy(_tbVecCurr);
+      return;
+    }
+    _tbAxis.normalize();
+    const angle = Math.acos(dot) * 1.45;
+    _tbQuat.setFromAxisAngle(_tbAxis, angle);
+    this.trackballDeltaQuat.premultiply(_tbQuat).normalize();
+    this.trackballStartVec.copy(_tbVecCurr);
+    this.trackballMoved = true;
+
+    if (this.workMode === 'object') {
+      const g = visual.group;
+      _tbQuatStart
+        .copy(this.trackballDeltaQuat)
+        .multiply(this.trackballStartQuat)
+        .normalize();
+      g.quaternion.copy(_tbQuatStart);
+      const liveTransform: ObjectTransform = {
+        position: [g.position.x, g.position.y, g.position.z],
+        rotation: [g.rotation.x, g.rotation.y, g.rotation.z],
+        scale: [g.scale.x, g.scale.y, g.scale.z],
+      };
+      this.syncLiveObjectTransformAndMirrors(
+        this.selectedObjectId,
+        liveTransform,
+      );
+    } else if (this.editDragStartMesh) {
+      this.applyTrackballEditMesh(visual);
+    }
+
+    this.requestRender();
+  }
+
+  private endTrackballRotate(): void {
+    if (!this.isTrackballDragging) return;
+    const wasMoved = this.trackballMoved;
+    this.isTrackballDragging = false;
+    this.trackballMoved = false;
+    this.callbacks.onTrackballActiveChange?.(false);
+
+    const objId = this.selectedObjectId;
+    const visual = objId ? this.visuals.get(objId) : undefined;
+
+    if (this.workMode === 'object' && this.objectDragStartTransform) {
+      const before = this.objectDragStartTransform;
+      this.objectDragStartTransform = null;
+      if (wasMoved && objId && visual) {
+        const g = visual.group;
+        const after: ObjectTransform = {
+          position: [g.position.x, g.position.y, g.position.z],
+          rotation: [g.rotation.x, g.rotation.y, g.rotation.z],
+          scale: [g.scale.x, g.scale.y, g.scale.z],
+        };
+        this.callbacks.onCommitObjectTransform(objId, before, after);
+      }
+    } else if (this.workMode === 'edit' && this.editDragStartMesh) {
+      const before = this.editDragStartMesh;
+      this.editDragStartMesh = null;
+      this.editDragStartVertexPositions.clear();
+      this.proportionalDragField = null;
+      this.proportionalDragWeights.clear();
+      this.proportionalPreviewField = null;
+      if (wasMoved && objId && visual) {
+        const after = visual.baseEditableMesh.clone();
+        this.callbacks.onCommitMeshEdit(objId, before, after);
+      }
+    }
+
+    this.syncGizmoAttachment();
+    this.requestRender();
+  }
+
+  private cancelTrackballRotate(): void {
+    if (!this.isTrackballDragging) return;
+    this.isTrackballDragging = false;
+    this.trackballMoved = false;
+    this.callbacks.onTrackballActiveChange?.(false);
+
+    const visual = this.selectedObjectId
+      ? this.visuals.get(this.selectedObjectId)
+      : undefined;
+
+    if (this.workMode === 'object' && this.objectDragStartTransform) {
+      const before = this.objectDragStartTransform;
+      this.objectDragStartTransform = null;
+      if (visual && this.selectedObjectId) {
+        visual.group.position.set(...before.position);
+        visual.group.rotation.set(...before.rotation);
+        visual.group.scale.set(...before.scale);
+        this.syncLiveObjectTransformAndMirrors(this.selectedObjectId, before);
+      }
+    } else if (this.workMode === 'edit' && this.editDragStartMesh) {
+      const before = this.editDragStartMesh;
+      this.editDragStartMesh = null;
+      this.editDragStartVertexPositions.clear();
+      this.proportionalDragField = null;
+      this.proportionalDragWeights.clear();
+      this.proportionalPreviewField = null;
+      if (visual) {
+        this.commitEditedMeshToVisual(visual, before, new Set());
+      }
+    }
+
+    this.syncGizmoAttachment();
+    this.requestRender();
+  }
+
+  /* ============================================================================
+   * G Button Modal Transform: Move (tap) & Vertex / Edge Slide (hold)
+   * ========================================================================== */
+
+  private canStartModalTransform(): boolean {
+    if (
+      !this.modalTransformMode ||
+      !this.selectedObjectId ||
+      this.loopCutPreviewMode ||
+      (this.suppressGizmo && this.modalTransformMode === 'move')
+    ) {
+      return false;
+    }
+    const visual = this.visuals.get(this.selectedObjectId);
+    if (!visual || !visual.group.visible || visual.locked) return false;
+
+    if (this.modalTransformMode === 'move') {
+      if (this.workMode === 'object') return true;
+      const vertIds = visual.baseEditableMesh.getVertexIdsFromSelection(
+        this.editSelectionMode,
+        this.selectedComponentIds,
+      );
+      return vertIds.size > 0;
+    }
+
+    if (this.workMode !== 'edit') return false;
+
+    if (this.modalTransformMode === 'vertex_slide') {
+      if (this.editSelectionMode !== 'vertex') return false;
+      return buildVertexSlidePlan(
+        visual.baseEditableMesh,
+        this.selectedComponentIds,
+      ).valid;
+    }
+
+    if (this.modalTransformMode === 'edge_slide') {
+      if (this.editSelectionMode !== 'edge') return false;
+      return buildEdgeSlidePlan(
+        visual.baseEditableMesh,
+        this.selectedComponentIds,
+      ).valid;
+    }
+
+    return false;
+  }
+
+  private raycastPointerToPlane(
+    clientX: number,
+    clientY: number,
+    plane: THREE.Plane,
+    out: THREE.Vector3,
+  ): boolean {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const w = Math.max(1, rect.width);
+    const h = Math.max(1, rect.height);
+    const ndcX = ((clientX - rect.left) / w) * 2 - 1;
+    const ndcY = -((clientY - rect.top) / h) * 2 + 1;
+    this.raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.activeCamera);
+    return this.raycaster.ray.intersectPlane(plane, out) !== null;
+  }
+
+  private projectWorldPointToCanvasPx(worldPoint: THREE.Vector3): {
+    x: number;
+    y: number;
+  } {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const w = Math.max(1, rect.width);
+    const h = Math.max(1, rect.height);
+    const p = _v2.copy(worldPoint).project(this.activeCamera);
+    return {
+      x: ((p.x + 1) * 0.5) * w,
+      y: ((-p.y + 1) * 0.5) * h,
+    };
+  }
+
+  private applyModalMoveEditMesh(
+    visual: ObjectVisual,
+    deltaWorld: THREE.Vector3,
+  ): void {
+    if (!this.editDragStartMesh) return;
+    const nextMesh = this.editDragStartMesh.clone();
+    visual.group.updateMatrixWorld(true);
+    _mat4B.copy(visual.group.matrixWorld).invert();
+
+    let affectedVertexIds: Set<string>;
+    if (this.proportionalSettings.enabled) {
+      this.refreshProportionalDragWeights(false);
+      _quat.identity();
+      affectedVertexIds = applyProportionalWorldAnchorTransform(
+        nextMesh,
+        this.editDragStartMesh,
+        this.proportionalDragWeights,
+        {
+          startAnchorWorld: this.editDragStartAnchorPos,
+          deltaPosWorld: deltaWorld,
+          deltaQuatWorld: _quat,
+          deltaScaleWorld: _oneVec,
+          objectMatrixWorld: visual.group.matrixWorld,
+          objectMatrixWorldInv: _mat4B,
+        },
+      );
+    } else {
+      _mat4A.makeTranslation(deltaWorld.x, deltaWorld.y, deltaWorld.z);
+      _mat4C.multiplyMatrices(_mat4B, _mat4A);
+      _mat4C.multiply(visual.group.matrixWorld);
+      applyTransformToVertices(
+        nextMesh,
+        this.editDragStartVertexIds,
+        _mat4C,
+        [0, 0, 0],
+      );
+      affectedVertexIds = this.editDragStartVertexIds;
+    }
+
+    this.commitEditedMeshToVisual(visual, nextMesh, affectedVertexIds);
+  }
+
+  private startModalTransform(startX: number, startY: number): void {
+    if (!this.canStartModalTransform() || !this.selectedObjectId || !this.modalTransformMode) {
+      return;
+    }
+    const visual = this.visuals.get(this.selectedObjectId);
+    if (!visual) return;
+
+    this.isModalDragging = true;
+    this.modalMoved = false;
+    this.modalStartX = startX;
+    this.modalStartY = startY;
+    this.modalLastDeltaWorld.set(0, 0, 0);
+    this.modalVertexSlidePlan = null;
+    this.modalEdgeSlidePlan = null;
+    this.modalEdgeSlideAxis2D = null;
+    this.orbitControls.enabled = false;
+
+    if (this.workMode === 'object') {
+      const g = visual.group;
+      this.objectDragStartTransform = {
+        position: [g.position.x, g.position.y, g.position.z],
+        rotation: [g.rotation.x, g.rotation.y, g.rotation.z],
+        scale: [g.scale.x, g.scale.y, g.scale.z],
+      };
+      this.modalStartObjPos.copy(g.position);
+      this.editDragStartAnchorPos.copy(g.position);
+    } else {
+      this.editDragStartMesh = visual.baseEditableMesh.clone();
+      this.editDragStartVertexIds = visual.baseEditableMesh.getVertexIdsFromSelection(
+        this.editSelectionMode,
+        this.selectedComponentIds,
+      );
+      this.editDragStartVertexPositions.clear();
+      for (const v of this.editDragStartMesh.vertices) {
+        this.editDragStartVertexPositions.set(v.id, [...v.position]);
+      }
+      const centroidLocal = visual.baseEditableMesh.computeCentroid(
+        this.editDragStartVertexIds,
+      );
+      if (!centroidLocal) {
+        this.isModalDragging = false;
+        this.editDragStartMesh = null;
+        return;
+      }
+      visual.group.updateMatrixWorld(true);
+      this.editDragStartAnchorPos
+        .set(centroidLocal[0], centroidLocal[1], centroidLocal[2])
+        .applyMatrix4(visual.group.matrixWorld);
+
+      if (this.modalTransformMode === 'move') {
+        this.proportionalDragField = null;
+        this.proportionalDragWeights.clear();
+        this.proportionalDragRadiusUsed = -1;
+        this.proportionalDragFalloffUsed = '';
+        this.refreshProportionalDragWeights(true);
+      } else if (this.modalTransformMode === 'vertex_slide') {
+        const plan = buildVertexSlidePlan(
+          this.editDragStartMesh,
+          this.editDragStartVertexIds,
+        );
+        if (!plan.valid) {
+          this.isModalDragging = false;
+          this.editDragStartMesh = null;
+          return;
+        }
+        this.modalVertexSlidePlan = plan;
+      } else if (this.modalTransformMode === 'edge_slide') {
+        const plan = buildEdgeSlidePlan(
+          this.editDragStartMesh,
+          this.selectedComponentIds,
+        );
+        if (!plan.valid) {
+          this.isModalDragging = false;
+          this.editDragStartMesh = null;
+          return;
+        }
+        this.modalEdgeSlidePlan = plan;
+
+        // Precompute locked screen-space axis for Edge Slide
+        this.activeCamera.updateMatrixWorld(true);
+        let cx = 0;
+        let cy = 0;
+        let cz = 0;
+        let cnt = 0;
+        for (const rail of plan.railsByVertex.values()) {
+          cx += rail.startPos[0];
+          cy += rail.startPos[1];
+          cz += rail.startPos[2];
+          cnt++;
+        }
+        if (cnt > 0) {
+          cx /= cnt;
+          cy /= cnt;
+          cz /= cnt;
+        }
+        const worldC = new THREE.Vector3(cx, cy, cz).applyMatrix4(
+          visual.group.matrixWorld,
+        );
+        const worldA = new THREE.Vector3(
+          cx + plan.avgDirA[0] * plan.avgLenA,
+          cy + plan.avgDirA[1] * plan.avgLenA,
+          cz + plan.avgDirA[2] * plan.avgLenA,
+        ).applyMatrix4(visual.group.matrixWorld);
+        const worldB = new THREE.Vector3(
+          cx + plan.avgDirB[0] * plan.avgLenB,
+          cy + plan.avgDirB[1] * plan.avgLenB,
+          cz + plan.avgDirB[2] * plan.avgLenB,
+        ).applyMatrix4(visual.group.matrixWorld);
+
+        const p0 = this.projectWorldPointToCanvasPx(worldC);
+        const pA = this.projectWorldPointToCanvasPx(worldA);
+        const pB = this.projectWorldPointToCanvasPx(worldB);
+        const vAx = pA.x - p0.x;
+        const vAy = pA.y - p0.y;
+        const vBx = pB.x - p0.x;
+        const vBy = pB.y - p0.y;
+        const combX = vAx - vBx;
+        const combY = vAy - vBy;
+        const combLen = Math.hypot(combX, combY);
+        const dirX = combLen > 2 ? combX / combLen : 1;
+        const dirY = combLen > 2 ? combY / combLen : 0;
+        const lenPosPx = Math.max(24, Math.abs(vAx * dirX + vAy * dirY) || 75);
+        const lenNegPx = Math.max(24, Math.abs(vBx * dirX + vBy * dirY) || lenPosPx);
+        this.modalEdgeSlideAxis2D = { dirX, dirY, lenPosPx, lenNegPx };
+      }
+    }
+
+    if (this.modalTransformMode === 'move') {
+      const camDir = new THREE.Vector3();
+      this.activeCamera.getWorldDirection(camDir).normalize();
+      if (this.axisConstraint === 'free') {
+        this.modalAxisDirWorld.set(0, 0, 0);
+        this.modalDragPlane.setFromNormalAndCoplanarPoint(
+          camDir.clone().negate(),
+          this.editDragStartAnchorPos,
+        );
+      } else {
+        this.modalAxisDirWorld.set(
+          this.axisConstraint === 'x' ? 1 : 0,
+          this.axisConstraint === 'y' ? 1 : 0,
+          this.axisConstraint === 'z' ? 1 : 0,
+        );
+        const side = new THREE.Vector3().crossVectors(
+          camDir,
+          this.modalAxisDirWorld,
+        );
+        let planeNormal = new THREE.Vector3().crossVectors(
+          this.modalAxisDirWorld,
+          side,
+        );
+        if (planeNormal.lengthSq() < 1e-6) {
+          planeNormal.copy(camDir).negate();
+        } else {
+          planeNormal.normalize();
+        }
+        this.modalDragPlane.setFromNormalAndCoplanarPoint(
+          planeNormal,
+          this.editDragStartAnchorPos,
+        );
+      }
+
+      if (
+        !this.raycastPointerToPlane(
+          startX,
+          startY,
+          this.modalDragPlane,
+          this.modalDragStartPointWorld,
+        )
+      ) {
+        this.modalDragStartPointWorld.copy(this.editDragStartAnchorPos);
+      }
+    }
+
+    const modeLabel =
+      this.modalTransformMode === 'vertex_slide'
+        ? 'Deslizar vértice'
+        : this.modalTransformMode === 'edge_slide'
+          ? 'Deslizar arista'
+          : 'Mover (G)';
+    this.callbacks.onModalTransformStatusChange?.({
+      active: true,
+      mode: this.modalTransformMode,
+      label: modeLabel,
+      deltaText: this.modalTransformMode === 'move' ? '0.00, 0.00, 0.00' : '0%',
+      clamped: false,
+    });
+    this.requestRender();
+  }
+
+  private updateModalTransform(clientX: number, clientY: number): void {
+    if (!this.isModalDragging || !this.selectedObjectId || !this.modalTransformMode) {
+      return;
+    }
+    const visual = this.visuals.get(this.selectedObjectId);
+    if (!visual) return;
+
+    if (this.modalTransformMode === 'move') {
+      const hit = this.raycastPointerToPlane(
+        clientX,
+        clientY,
+        this.modalDragPlane,
+        _modalCurrPoint,
+      );
+      if (hit) {
+        _modalDelta.subVectors(_modalCurrPoint, this.modalDragStartPointWorld);
+      } else {
+        // Fallback screen-aligned translation at grazing camera angles
+        const dist = this.activeCamera.position.distanceTo(
+          this.editDragStartAnchorPos,
+        );
+        const scale = Math.max(0.002, dist * 0.002);
+        _modalCamRight.set(1, 0, 0).applyQuaternion(this.activeCamera.quaternion);
+        _modalCamUp.set(0, 1, 0).applyQuaternion(this.activeCamera.quaternion);
+        _modalDelta
+          .set(0, 0, 0)
+          .addScaledVector(_modalCamRight, (clientX - this.modalStartX) * scale)
+          .addScaledVector(_modalCamUp, -(clientY - this.modalStartY) * scale);
+      }
+
+      if (this.axisConstraint !== 'free') {
+        const proj = _modalDelta.dot(this.modalAxisDirWorld);
+        _modalDelta.copy(this.modalAxisDirWorld).multiplyScalar(proj);
+      }
+
+      if (this.settings?.snapEnabled) {
+        const step = Math.max(1e-4, this.settings.snapTranslateStep || 0.25);
+        _modalDelta.x = Math.round(_modalDelta.x / step) * step;
+        _modalDelta.y = Math.round(_modalDelta.y / step) * step;
+        _modalDelta.z = Math.round(_modalDelta.z / step) * step;
+      }
+
+      this.modalMoved = true;
+      this.modalLastDeltaWorld.copy(_modalDelta);
+
+      if (this.workMode === 'object') {
+        const g = visual.group;
+        g.position.copy(this.modalStartObjPos).add(_modalDelta);
+        const liveTransform: ObjectTransform = {
+          position: [g.position.x, g.position.y, g.position.z],
+          rotation: [g.rotation.x, g.rotation.y, g.rotation.z],
+          scale: [g.scale.x, g.scale.y, g.scale.z],
+        };
+        this.syncLiveObjectTransformAndMirrors(
+          this.selectedObjectId,
+          liveTransform,
+        );
+      } else if (this.editDragStartMesh) {
+        this.applyModalMoveEditMesh(visual, _modalDelta);
+      }
+
+      this.callbacks.onModalTransformStatusChange?.({
+        active: true,
+        mode: 'move',
+        label:
+          this.axisConstraint === 'free'
+            ? 'Mover (Libre)'
+            : `Mover (${this.axisConstraint.toUpperCase()})`,
+        deltaText: `${_modalDelta.x >= 0 ? '+' : ''}${_modalDelta.x.toFixed(2)}, ${_modalDelta.y >= 0 ? '+' : ''}${_modalDelta.y.toFixed(2)}, ${_modalDelta.z >= 0 ? '+' : ''}${_modalDelta.z.toFixed(2)}`,
+      });
+      this.requestRender();
+      return;
+    }
+
+    if (
+      this.modalTransformMode === 'vertex_slide' &&
+      this.editDragStartMesh &&
+      this.modalVertexSlidePlan
+    ) {
+      const dragDx = clientX - this.modalStartX;
+      const dragDy = clientY - this.modalStartY;
+      const dragLen = Math.hypot(dragDx, dragDy);
+      this.modalMoved = true;
+
+      if (dragLen < 1) {
+        this.commitEditedMeshToVisual(
+          visual,
+          this.editDragStartMesh.clone(),
+          new Set(),
+        );
+        this.callbacks.onModalTransformStatusChange?.({
+          active: true,
+          mode: 'vertex_slide',
+          label: 'Deslizar vértice',
+          deltaText: '0%',
+        });
+        this.requestRender();
+        return;
+      }
+
+      visual.group.updateMatrixWorld(true);
+      this.activeCamera.updateMatrixWorld(true);
+      const selections: VertexSlideSelection[] = [];
+
+      for (const vid of this.modalVertexSlidePlan.vertexIds) {
+        const options = this.modalVertexSlidePlan.railsByVertex.get(vid);
+        if (!options || options.length === 0) continue;
+
+        const wStart = new THREE.Vector3(...options[0].startPos).applyMatrix4(
+          visual.group.matrixWorld,
+        );
+        const p0 = this.projectWorldPointToCanvasPx(wStart);
+
+        let bestPosOpt = null as (typeof options)[number] | null;
+        let bestPosCos = 0.05;
+        let bestPosVec = { vx: 0, vy: 0, vLen: 0 };
+
+        let bestAbsOpt = options[0];
+        let bestAbsCos = -1;
+        let bestAbsVec = { vx: 0, vy: 0, vLen: 0 };
+
+        for (const opt of options) {
+          const wTarget = new THREE.Vector3(...opt.targetPos).applyMatrix4(
+            visual.group.matrixWorld,
+          );
+          const p1 = this.projectWorldPointToCanvasPx(wTarget);
+          const vx = p1.x - p0.x;
+          const vy = p1.y - p0.y;
+          const vLen = Math.hypot(vx, vy);
+          if (vLen < 1e-4) continue;
+          const cos = (dragDx * vx + dragDy * vy) / (dragLen * vLen);
+          if (cos > bestPosCos) {
+            bestPosCos = cos;
+            bestPosOpt = opt;
+            bestPosVec = { vx, vy, vLen };
+          }
+          if (Math.abs(cos) > bestAbsCos) {
+            bestAbsCos = Math.abs(cos);
+            bestAbsOpt = opt;
+            bestAbsVec = { vx, vy, vLen };
+          }
+        }
+
+        const chosen = bestPosOpt ?? (!this.modalSlideClamp ? bestAbsOpt : null);
+        const chosenVec = bestPosOpt ? bestPosVec : bestAbsVec;
+        if (!chosen || chosenVec.vLen < 1e-4) continue;
+
+        const denom = Math.max(20, chosenVec.vLen);
+        const factor =
+          (dragDx * chosenVec.vx + dragDy * chosenVec.vy) /
+          (chosenVec.vLen * denom);
+        selections.push({
+          vertexId: vid,
+          edgeId: chosen.edgeId,
+          neighborId: chosen.neighborId,
+          startPos: chosen.startPos,
+          targetPos: chosen.targetPos,
+          factor,
+        });
+      }
+
+      const res = applyVertexSlideFromScreenSelections(
+        this.editDragStartMesh,
+        selections,
+        this.modalSlideClamp,
+      );
+      this.commitEditedMeshToVisual(visual, res.mesh, res.movedVertexIds);
+
+      this.callbacks.onModalTransformStatusChange?.({
+        active: true,
+        mode: 'vertex_slide',
+        label: 'Deslizar vértice',
+        deltaText: `${Math.round(res.appliedFactor * 100)}%`,
+        clamped: res.clamped,
+      });
+      this.requestRender();
+      return;
+    }
+
+    if (
+      this.modalTransformMode === 'edge_slide' &&
+      this.editDragStartMesh &&
+      this.modalEdgeSlidePlan &&
+      this.modalEdgeSlideAxis2D
+    ) {
+      const dragDx = clientX - this.modalStartX;
+      const dragDy = clientY - this.modalStartY;
+      const axis = this.modalEdgeSlideAxis2D;
+      const proj = dragDx * axis.dirX + dragDy * axis.dirY;
+      const denom = proj >= 0 ? axis.lenPosPx : axis.lenNegPx;
+      const factor = proj / Math.max(20, denom);
+
+      this.modalMoved = true;
+      const res = applyEdgeSlide(
+        this.editDragStartMesh,
+        this.modalEdgeSlidePlan,
+        factor,
+        this.modalSlideClamp,
+      );
+      this.commitEditedMeshToVisual(visual, res.mesh, res.movedVertexIds);
+
+      const pct = Math.round(res.appliedFactor * 100);
+      this.callbacks.onModalTransformStatusChange?.({
+        active: true,
+        mode: 'edge_slide',
+        label: 'Deslizar arista',
+        deltaText: `${pct >= 0 ? '+' : ''}${pct}%`,
+        clamped: res.clamped,
+      });
+      this.requestRender();
+    }
+  }
+
+  private endModalTransform(): void {
+    if (!this.isModalDragging) return;
+    const wasMoved = this.modalMoved;
+    this.isModalDragging = false;
+    this.modalMoved = false;
+    this.modalVertexSlidePlan = null;
+    this.modalEdgeSlidePlan = null;
+    this.modalEdgeSlideAxis2D = null;
+    this.callbacks.onModalTransformStatusChange?.(null);
+
+    const objId = this.selectedObjectId;
+    const visual = objId ? this.visuals.get(objId) : undefined;
+    let committed = false;
+
+    if (this.workMode === 'object' && this.objectDragStartTransform) {
+      const before = this.objectDragStartTransform;
+      this.objectDragStartTransform = null;
+      if (wasMoved && objId && visual) {
+        const g = visual.group;
+        const after: ObjectTransform = {
+          position: [g.position.x, g.position.y, g.position.z],
+          rotation: [g.rotation.x, g.rotation.y, g.rotation.z],
+          scale: [g.scale.x, g.scale.y, g.scale.z],
+        };
+        this.callbacks.onCommitObjectTransform(objId, before, after);
+        committed = true;
+      }
+    } else if (this.workMode === 'edit' && this.editDragStartMesh) {
+      const before = this.editDragStartMesh;
+      this.editDragStartMesh = null;
+      this.editDragStartVertexPositions.clear();
+      this.proportionalDragField = null;
+      this.proportionalDragWeights.clear();
+      this.proportionalPreviewField = null;
+      if (wasMoved && objId && visual) {
+        const after = visual.baseEditableMesh.clone();
+        this.callbacks.onCommitMeshEdit(objId, before, after);
+        committed = true;
+      }
+    }
+
+    this.callbacks.onCompleteModalTransform?.(committed);
+    this.syncGizmoAttachment();
+    this.requestRender();
+  }
+
+  private cancelModalTransform(): void {
+    if (!this.isModalDragging && !this.objectDragStartTransform && !this.editDragStartMesh) {
+      this.callbacks.onModalTransformStatusChange?.(null);
+      return;
+    }
+    this.isModalDragging = false;
+    this.modalMoved = false;
+    this.modalVertexSlidePlan = null;
+    this.modalEdgeSlidePlan = null;
+    this.modalEdgeSlideAxis2D = null;
+    this.callbacks.onModalTransformStatusChange?.(null);
+
+    const visual = this.selectedObjectId
+      ? this.visuals.get(this.selectedObjectId)
+      : undefined;
+
+    if (this.workMode === 'object' && this.objectDragStartTransform) {
+      const before = this.objectDragStartTransform;
+      this.objectDragStartTransform = null;
+      if (visual && this.selectedObjectId) {
+        visual.group.position.set(...before.position);
+        visual.group.rotation.set(...before.rotation);
+        visual.group.scale.set(...before.scale);
+        this.syncLiveObjectTransformAndMirrors(this.selectedObjectId, before);
+      }
+    } else if (this.workMode === 'edit' && this.editDragStartMesh) {
+      const before = this.editDragStartMesh;
+      this.editDragStartMesh = null;
+      this.editDragStartVertexPositions.clear();
+      this.proportionalDragField = null;
+      this.proportionalDragWeights.clear();
+      this.proportionalPreviewField = null;
+      if (visual) {
+        this.commitEditedMeshToVisual(visual, before, new Set());
+      }
+    }
+
+    this.syncGizmoAttachment();
+    this.requestRender();
   }
 
   private buildModifiersSignature(
@@ -1879,10 +2892,25 @@ export class ViewportEngine {
     loopCutPreviewRingEdgeIds?: string[];
     loopCutPreviewFaceIds?: string[];
     loopCutSlideActive?: boolean;
+    mergeCursorPosition?: Vec3 | null;
+    modalTransformMode?: ModalGMode | null;
+    modalSlideClamp?: boolean;
+    modalCancelNonce?: number;
   }): void {
+    if (
+      params.modalCancelNonce !== undefined &&
+      params.modalCancelNonce !== this.modalCancelNonce
+    ) {
+      this.modalCancelNonce = params.modalCancelNonce;
+      this.cancelModalTransform();
+    }
+    this.modalTransformMode = params.modalTransformMode ?? null;
+    this.modalSlideClamp = params.modalSlideClamp ?? true;
+
     this.virtualModifiers = params.virtualModifiers
       ? { ...params.virtualModifiers }
       : { ...EMPTY_MODIFIER_STATE };
+    this.gestureManager.setExternalModifiers(this.virtualModifiers);
     this.selectedObjectId = params.selectedObjectId;
     const nextSelObjs = new Set<string>(
       params.selectedObjectIds ? Array.from(params.selectedObjectIds) : [],
@@ -1919,7 +2947,10 @@ export class ViewportEngine {
     this.showFaceOrientation = Boolean(params.settings.showFaceOrientation);
     this.gestureManager.updateConfig(params.settings.touch);
     this.gestureManager.syncWorkMode(params.workMode);
-    this.suppressGizmo = Boolean(params.suppressGizmo);
+    this.suppressGizmo =
+      Boolean(params.suppressGizmo) ||
+      this.modalTransformMode === 'vertex_slide' ||
+      this.modalTransformMode === 'edge_slide';
     this.loopCutPreviewMode = Boolean(params.loopCutPreviewMode);
     this.loopCutPreviewSegments = params.loopCutPreviewSegments ?? [];
     this.loopCutPreviewRingEdgeIds = new Set(
@@ -1932,6 +2963,12 @@ export class ViewportEngine {
       this.orbitControls.enableRotate = true;
     } else {
       this.orbitControls.enableRotate = false;
+    }
+    if (params.mergeCursorPosition && params.workMode === 'edit') {
+      this.mergeCursorMarker.position.set(...params.mergeCursorPosition);
+      this.mergeCursorMarker.visible = true;
+    } else {
+      this.mergeCursorMarker.visible = false;
     }
 
     // Grid & Axes visibility
@@ -1958,7 +2995,7 @@ export class ViewportEngine {
       visual.locked = objData.locked;
 
       // Update transform unless currently dragging this object in Object Mode
-      if (!(this.isGizmoDragging && this.workMode === 'object' && this.selectedObjectId === objData.id)) {
+      if (!(this.isAnyTransformDragging() && this.workMode === 'object' && this.selectedObjectId === objData.id)) {
         visual.group.position.set(...objData.transform.position);
         visual.group.rotation.set(...objData.transform.rotation);
         visual.group.scale.set(...objData.transform.scale);
@@ -1972,7 +3009,7 @@ export class ViewportEngine {
       if (objData.objectType === 'reference_image' && objData.referenceImage) {
         this.syncReferenceVisual(visual, objData, isSelected);
       } else {
-        if (!(this.isGizmoDragging && this.workMode === 'edit' && this.selectedObjectId === objData.id)) {
+        if (!(this.isAnyTransformDragging() && this.workMode === 'edit' && this.selectedObjectId === objData.id)) {
           const modSig = this.buildModifiersSignature(objData, this.sceneTransformRefs);
           if (
             visual.lastMeshData !== objData.mesh ||
@@ -2026,17 +3063,31 @@ export class ViewportEngine {
 
     if (
       propChanged &&
-      this.isGizmoDragging &&
+      this.isAnyTransformDragging() &&
       this.workMode === 'edit' &&
       this.editDragStartMesh
     ) {
       this.refreshProportionalDragWeights(false);
-      this.handleGizmoObjectChange();
+      if (this.isTrackballDragging && this.selectedObjectId) {
+        const visual = this.visuals.get(this.selectedObjectId);
+        if (visual) this.applyTrackballEditMesh(visual);
+      } else if (
+        this.isModalDragging &&
+        this.modalTransformMode === 'move' &&
+        this.selectedObjectId
+      ) {
+        const visual = this.visuals.get(this.selectedObjectId);
+        if (visual) {
+          this.applyModalMoveEditMesh(visual, this.modalLastDeltaWorld);
+        }
+      } else {
+        this.handleGizmoObjectChange();
+      }
     } else {
       this.syncEditModeOverlays();
     }
     this.syncGizmoSettings();
-    if (!this.isGizmoDragging) {
+    if (!this.isAnyTransformDragging()) {
       this.syncGizmoAttachment();
     }
 
@@ -2216,8 +3267,8 @@ export class ViewportEngine {
     });
     const solidGeoInit = new THREE.BufferGeometry();
     const solidMesh = new THREE.Mesh(solidGeoInit, solidMat);
-    solidMesh.castShadow = !this.isSoftwareGl;
-    solidMesh.receiveShadow = true;
+    solidMesh.castShadow = false;
+    solidMesh.receiveShadow = false;
     solidMesh.userData.objectId = objData.id;
 
     const faceOrientationFrontMat = new THREE.MeshStandardMaterial({
@@ -2354,9 +3405,8 @@ export class ViewportEngine {
     const solidMat = visual.solidMesh.material;
     visual.solidMesh.visible =
       !faceOrientActive && !isWireframe && visual.hasFaces;
-    visual.solidMesh.castShadow =
-      !faceOrientActive && !isWireframe && !isXray && !this.isSoftwareGl;
-    visual.solidMesh.receiveShadow = !faceOrientActive && !isWireframe && !isXray;
+    visual.solidMesh.castShadow = false;
+    visual.solidMesh.receiveShadow = false;
     visual.solidMesh.renderOrder = 0;
 
     if (solidMat.transparent !== isXray) {
@@ -2544,6 +3594,7 @@ export class ViewportEngine {
       'position',
       new THREE.BufferAttribute(edgePositions.subarray(0, ptr), 3),
     );
+    wireGeo.computeBoundingBox();
     wireGeo.computeBoundingSphere();
     visual.wireEdges.geometry.dispose();
     visual.wireEdges.geometry = wireGeo;
@@ -2790,7 +3841,7 @@ export class ViewportEngine {
       this.selectedComponentIds.size > 0 &&
       !this.loopCutPreviewMode;
     const activeWeights = propActive
-      ? this.isGizmoDragging
+      ? this.isAnyTransformDragging()
         ? this.proportionalDragWeights
         : this.getProportionalPreviewWeights(visual)
       : null;
@@ -2917,6 +3968,46 @@ export class ViewportEngine {
       this.loopCutPreviewBars.visible = false;
       this.loopCutPreviewPoints.visible = false;
     }
+
+    // 6. Slide Rail Visual Guides (for Vertex Slide / Edge Slide via G hold)
+    if (
+      !this.loopCutPreviewMode &&
+      (this.modalTransformMode === 'vertex_slide' ||
+        this.modalTransformMode === 'edge_slide')
+    ) {
+      const refMesh = this.editDragStartMesh ?? mesh;
+      let guideSegments: [Vec3, Vec3][] = [];
+      if (this.modalTransformMode === 'vertex_slide') {
+        const vIds = refMesh.getVertexIdsFromSelection(
+          this.editSelectionMode,
+          this.selectedComponentIds,
+        );
+        guideSegments = buildVertexSlidePlan(refMesh, vIds).guideSegments;
+      } else {
+        guideSegments = buildEdgeSlidePlan(
+          refMesh,
+          this.selectedComponentIds,
+        ).guideSegments;
+      }
+      if (guideSegments.length > 0) {
+        const coords: number[] = [];
+        for (const [a, b] of guideSegments) {
+          coords.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+        }
+        const guideGeo = new THREE.BufferGeometry();
+        guideGeo.setAttribute(
+          'position',
+          new THREE.Float32BufferAttribute(coords, 3),
+        );
+        this.slideGuideLines.geometry.dispose();
+        this.slideGuideLines.geometry = guideGeo;
+        this.slideGuideLines.visible = true;
+      } else {
+        this.slideGuideLines.visible = false;
+      }
+    } else {
+      this.slideGuideLines.visible = false;
+    }
   }
 
   private syncProportionalRadiusRing(visual: ObjectVisual): void {
@@ -2934,6 +4025,9 @@ export class ViewportEngine {
     let hasCenter = false;
     if (this.isGizmoDragging && this.editDragStartMesh) {
       _v0.copy(this.editGizmoAnchor.position);
+      hasCenter = true;
+    } else if (this.isTrackballDragging && this.editDragStartMesh) {
+      _v0.copy(this.editDragStartAnchorPos);
       hasCenter = true;
     } else {
       const vertIds = visual.baseEditableMesh.getVertexIdsFromSelection(
@@ -3271,6 +4365,10 @@ export class ViewportEngine {
     (this.loopCutPreviewBars.material as THREE.Material).dispose();
     this.proportionalRing.geometry.dispose();
     (this.proportionalRing.material as THREE.Material).dispose();
+    this.mergeCursorMarker.geometry.dispose();
+    (this.mergeCursorMarker.material as THREE.Material).dispose();
+    this.slideGuideLines.geometry.dispose();
+    (this.slideGuideLines.material as THREE.Material).dispose();
 
     for (const visual of this.visuals.values()) {
       this.disposeObjectVisual(visual);

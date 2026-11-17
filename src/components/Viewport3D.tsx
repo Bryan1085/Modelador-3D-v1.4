@@ -6,8 +6,12 @@ import React, {
   useRef,
   useState,
 } from 'react';
+import { Rotate3d } from 'lucide-react';
 import { EditableMesh, Vec3 } from '../core/mesh/EditableMesh';
-import { DeleteActionType } from '../core/mesh/advancedOperations';
+import {
+  DeleteActionType,
+  EdgeSelectionTool,
+} from '../core/mesh/advancedOperations';
 import { EditSelectionMode } from '../core/mesh/operations';
 import { PrimitiveOptions, PrimitiveType } from '../core/mesh/primitives';
 import { ProportionalFalloff } from '../core/mesh/proportionalEditing';
@@ -32,6 +36,7 @@ import {
   BoxSelectOverlayState,
   CameraPreset,
   CameraQuaternionTuple,
+  ModalTransformStatus,
   ViewportContextInfo,
   ViewportEngine,
 } from '../engine/ViewportEngine';
@@ -39,8 +44,11 @@ import {
   EditOperatorParams,
   EditOperatorSession,
   EditOperatorType,
+  ModalTransformState,
 } from '../state/useModelerStore';
 import { AxisGizmoHandle, AxisGizmoWidget } from './AxisGizmoWidget';
+import { CtrlAltOperationsMenu } from './CtrlAltOperationsMenu';
+import { CtrlShiftPrimitivesMenu } from './CtrlShiftPrimitivesMenu';
 import { EditOperatorBar } from './EditOperatorBar';
 import { FloatingModifierPanel } from './FloatingModifierPanel';
 import { FloatingRadialMenu } from './FloatingRadialMenu';
@@ -61,6 +69,7 @@ interface Viewport3DProps {
   selectedObjectIds?: Set<string>;
   workMode: WorkMode;
   editSelectionMode: EditSelectionMode;
+  edgeSelectionTool?: EdgeSelectionTool;
   selectedComponentIds: Set<string>;
   activeTool: TransformTool;
   axisConstraint: AxisConstraint;
@@ -72,6 +81,8 @@ interface Viewport3DProps {
   screenModifiers: TouchModifierState;
   operatorSession: EditOperatorSession | null;
   operatorMergedCount?: number;
+  operatorError?: string | null;
+  operatorStatusMessage?: string | null;
   loopCutPreviewSegments: [Vec3, Vec3][];
   loopCutRingEdgeIds?: string[];
   loopCutFaceIds?: string[];
@@ -127,13 +138,22 @@ interface Viewport3DProps {
   onAddPrimitive: (type: PrimitiveType, options?: PrimitiveOptions) => void;
   onSelectTool: (tool: TransformTool) => void;
   onDuplicateObject: () => void;
+  onApplyObjectTransform: () => void;
+  onCenterObjectOrigin: () => void;
+  onSeparateSelectedGeometry: () => void;
   onHideObject: (id: string) => void;
   onDeleteObject: () => void;
   onToggleWorkMode: (mode: WorkMode) => void;
   onChangeEditSelectionMode: (mode: EditSelectionMode) => void;
+  onChangeEdgeSelectionTool?: (tool: EdgeSelectionTool) => void;
+  onSelectEdgeTopology?: (
+    kind: 'loop' | 'ring',
+    targetEdgeId?: string,
+  ) => void;
   onSelectAll: () => void;
   onDeselectAll: () => void;
   onStartOperator: (type: EditOperatorType) => void;
+  onSwitchMergeOperator?: (target: 'merge' | 'merge_by_distance') => void;
   onFillSelection: () => void;
   onConnectVertexPath: () => void;
   onRecalculateOutside: () => void;
@@ -147,6 +167,13 @@ interface Viewport3DProps {
   onChangeProportionalRadius: (radius: number) => void;
   onSaveProject: () => void;
   onOpenSettings: () => void;
+  modalTransform?: ModalTransformState | null;
+  modalCancelNonce?: number;
+  onGQuickTapMove?: () => void;
+  onGHoldSlide?: () => void;
+  onChangeModalClamp?: (clamp: boolean) => void;
+  onCancelModalTransform?: () => void;
+  onCompleteModalTransform?: (committed: boolean) => void;
 }
 
 export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
@@ -158,6 +185,7 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
       selectedObjectIds,
       workMode,
       editSelectionMode,
+      edgeSelectionTool = 'single',
       selectedComponentIds,
       activeTool,
       axisConstraint,
@@ -169,6 +197,8 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
       screenModifiers,
       operatorSession,
       operatorMergedCount = 0,
+      operatorError = null,
+      operatorStatusMessage = null,
       loopCutPreviewSegments,
       loopCutRingEdgeIds = [],
       loopCutFaceIds = [],
@@ -208,13 +238,19 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
       onAddPrimitive,
       onSelectTool,
       onDuplicateObject,
+      onApplyObjectTransform,
+      onCenterObjectOrigin,
+      onSeparateSelectedGeometry,
       onHideObject,
       onDeleteObject,
       onToggleWorkMode,
       onChangeEditSelectionMode,
+      onChangeEdgeSelectionTool,
+      onSelectEdgeTopology,
       onSelectAll,
       onDeselectAll,
       onStartOperator,
+      onSwitchMergeOperator,
       onFillSelection,
       onConnectVertexPath,
       onRecalculateOutside,
@@ -228,6 +264,13 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
       onChangeProportionalRadius,
       onSaveProject,
       onOpenSettings,
+      modalTransform = null,
+      modalCancelNonce = 0,
+      onGQuickTapMove,
+      onGHoldSlide,
+      onChangeModalClamp,
+      onCancelModalTransform,
+      onCompleteModalTransform,
     },
     ref,
   ) => {
@@ -244,9 +287,27 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
     const [physicalModifiers, setPhysicalModifiers] =
       useState<TouchModifierState>(EMPTY_MODIFIER_STATE);
     const [loopCutSlideActive, setLoopCutSlideActive] = useState(false);
+    const [trackballActive, setTrackballActive] = useState(false);
+    const [modalStatus, setModalStatus] = useState<ModalTransformStatus | null>(
+      null,
+    );
+    const [activeComboMenu, setActiveComboMenu] = useState<
+      'primitives' | 'operations' | null
+    >(null);
+    const physComboCandidateRef = useRef<'primitives' | 'operations' | null>(
+      null,
+    );
+    const physComboConsumedRef = useRef(false);
 
     useEffect(() => {
-      const updateFromKeyboardEvent = (e: KeyboardEvent) => {
+      const isTextTarget = (t: EventTarget | null) => {
+        const el = t as HTMLElement | null;
+        return Boolean(
+          el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'),
+        );
+      };
+
+      const syncPhysicalMods = (e: KeyboardEvent) => {
         setPhysicalModifiers((prev) => {
           const nextShift = e.shiftKey;
           const nextCtrl = e.ctrlKey || e.metaKey;
@@ -261,13 +322,66 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
           return { shift: nextShift, ctrl: nextCtrl, alt: nextAlt };
         });
       };
-      const resetPhysical = () => setPhysicalModifiers(EMPTY_MODIFIER_STATE);
-      window.addEventListener('keydown', updateFromKeyboardEvent);
-      window.addEventListener('keyup', updateFromKeyboardEvent);
+
+      const onKeyDown = (e: KeyboardEvent) => {
+        syncPhysicalMods(e);
+        if (isTextTarget(e.target)) return;
+
+        const isModifierKey =
+          e.key === 'Control' ||
+          e.key === 'Shift' ||
+          e.key === 'Alt' ||
+          e.key === 'Meta';
+        if (!isModifierKey) {
+          physComboConsumedRef.current = true;
+          physComboCandidateRef.current = null;
+          return;
+        }
+
+        if (!physComboConsumedRef.current) {
+          const ctrl = e.ctrlKey || e.metaKey;
+          if (ctrl && e.shiftKey && !e.altKey) {
+            physComboCandidateRef.current = 'primitives';
+          } else if (ctrl && e.altKey && !e.shiftKey) {
+            physComboCandidateRef.current = 'operations';
+          } else if (ctrl && e.shiftKey && e.altKey) {
+            physComboCandidateRef.current = null;
+          }
+        }
+      };
+
+      const onKeyUp = (e: KeyboardEvent) => {
+        syncPhysicalMods(e);
+        const ctrl = e.ctrlKey || e.metaKey;
+        const candidate = physComboCandidateRef.current;
+        if (
+          candidate &&
+          !physComboConsumedRef.current &&
+          (!ctrl || (candidate === 'primitives' && !e.shiftKey) || (candidate === 'operations' && !e.altKey))
+        ) {
+          physComboCandidateRef.current = null;
+          if (!isTextTarget(e.target)) {
+            setActiveComboMenu(candidate);
+          }
+        }
+        if (!ctrl && !e.shiftKey && !e.altKey) {
+          physComboConsumedRef.current = false;
+          physComboCandidateRef.current = null;
+        }
+      };
+
+      const resetPhysical = () => {
+        physComboConsumedRef.current = false;
+        physComboCandidateRef.current = null;
+        setPhysicalModifiers(EMPTY_MODIFIER_STATE);
+      };
+
+      window.addEventListener('keydown', onKeyDown);
+      window.addEventListener('keyup', onKeyUp);
       window.addEventListener('blur', resetPhysical);
       return () => {
-        window.removeEventListener('keydown', updateFromKeyboardEvent);
-        window.removeEventListener('keyup', updateFromKeyboardEvent);
+        window.removeEventListener('keydown', onKeyDown);
+        window.removeEventListener('keyup', onKeyUp);
         window.removeEventListener('blur', resetPhysical);
       };
     }, []);
@@ -356,6 +470,16 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
     [onUpdateOperatorConfig, operatorSession],
   );
 
+  const handleAltTap = useCallback(() => {
+    if (operatorSession) return;
+    onToggleWorkMode(workMode === 'object' ? 'edit' : 'object');
+  }, [onToggleWorkMode, operatorSession, workMode]);
+
+  const handleCloseComboMenu = useCallback(() => {
+    setActiveComboMenu(null);
+    onReleaseScreenModifiers();
+  }, [onReleaseScreenModifiers]);
+
   const callbacksRef = useRef({
     onSelectObject,
     onBoxSelectObjects,
@@ -368,6 +492,8 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
     onOpenContextMenu: handleOpenContextMenu,
     onModifierStateChange: (mods: TouchModifierState) =>
       setGestureModifiers(mods),
+    onAltTap: handleAltTap,
+    onTrackballActiveChange: (active: boolean) => setTrackballActive(active),
     onCameraPoseChange: (quat: CameraQuaternionTuple) => {
       gizmoRef.current?.updateOrientation(quat);
     },
@@ -375,6 +501,7 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
     onCommitObjectTransform,
     onCommitMeshEdit,
     onChangeProportionalRadius,
+    onCompleteModalTransform,
   });
   callbacksRef.current = {
     onSelectObject,
@@ -388,6 +515,8 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
     onOpenContextMenu: handleOpenContextMenu,
     onModifierStateChange: (mods: TouchModifierState) =>
       setGestureModifiers(mods),
+    onAltTap: handleAltTap,
+    onTrackballActiveChange: (active: boolean) => setTrackballActive(active),
     onCameraPoseChange: (quat: CameraQuaternionTuple) => {
       gizmoRef.current?.updateOrientation(quat);
     },
@@ -395,6 +524,7 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
     onCommitObjectTransform,
     onCommitMeshEdit,
     onChangeProportionalRadius,
+    onCompleteModalTransform,
   };
 
   useEffect(() => {
@@ -421,6 +551,12 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
         callbacksRef.current.onOpenContextMenu(info),
       onModifierStateChange: (mods) =>
         callbacksRef.current.onModifierStateChange(mods),
+      onAltTap: () => callbacksRef.current.onAltTap(),
+      onTrackballActiveChange: (active) =>
+        callbacksRef.current.onTrackballActiveChange(active),
+      onModalTransformStatusChange: (status) => setModalStatus(status),
+      onCompleteModalTransform: (committed) =>
+        callbacksRef.current.onCompleteModalTransform?.(committed),
       onCameraPoseChange: (quat) =>
         callbacksRef.current.onCameraPoseChange(quat),
       onLiveObjectTransform: (id, transform) =>
@@ -440,6 +576,30 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
     };
   }, []);
 
+  const externalModifiers: TouchModifierState = useMemo(
+    () => ({
+      shift: screenModifiers.shift || physicalModifiers.shift,
+      ctrl: screenModifiers.ctrl || physicalModifiers.ctrl,
+      alt: screenModifiers.alt || physicalModifiers.alt,
+    }),
+    [physicalModifiers, screenModifiers],
+  );
+
+  // Open CTRL+SHIFT (Primitives) or CTRL+ALT (Special Operations) when triggered from virtual modifier panel
+  useEffect(() => {
+    if (operatorSession) return;
+    if (screenModifiers.ctrl && screenModifiers.shift && !screenModifiers.alt) {
+      setActiveComboMenu('primitives');
+    } else if (screenModifiers.ctrl && screenModifiers.alt && !screenModifiers.shift) {
+      setActiveComboMenu('operations');
+    }
+  }, [
+    operatorSession,
+    screenModifiers.alt,
+    screenModifiers.ctrl,
+    screenModifiers.shift,
+  ]);
+
   useEffect(() => {
     engineRef.current?.syncScene({
       objects,
@@ -454,12 +614,20 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
       settings,
       meshRevision,
       suppressGizmo: Boolean(operatorSession),
-      virtualModifiers: screenModifiers,
+      virtualModifiers: externalModifiers,
       loopCutPreviewMode: operatorSession?.config.type === 'loop_cut',
       loopCutPreviewSegments,
       loopCutPreviewRingEdgeIds: loopCutRingEdgeIds,
       loopCutPreviewFaceIds: loopCutFaceIds,
       loopCutSlideActive,
+      mergeCursorPosition:
+        operatorSession?.config.type === 'merge' &&
+        operatorSession.config.params.mode === 'cursor'
+          ? (operatorSession.config.params.cursorPosition ?? [0, 0, 0])
+          : null,
+      modalTransformMode: modalTransform?.mode ?? null,
+      modalSlideClamp: modalTransform?.clamp ?? true,
+      modalCancelNonce,
     });
   }, [
     objects,
@@ -474,19 +642,25 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
     settings,
     meshRevision,
     operatorSession,
-    screenModifiers,
+    externalModifiers,
     loopCutPreviewSegments,
     loopCutRingEdgeIds,
     loopCutFaceIds,
     loopCutSlideActive,
+    modalTransform,
+    modalCancelNonce,
   ]);
 
   useEffect(() => {
     setContextMenu(null);
+    setActiveComboMenu(null);
     if (operatorSession?.config.type !== 'loop_cut') {
       setLoopCutSlideActive(false);
     }
-  }, [workMode, operatorSession]);
+    if (!modalTransform) {
+      setModalStatus(null);
+    }
+  }, [workMode, operatorSession, modalTransform]);
 
   const editSelectionDetails = useMemo(() => {
     if (workMode !== 'edit' || !selectedObject) {
@@ -568,7 +742,7 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
           </div>
         )}
 
-        {/* Top-Center: Proportional Editing HUD in Edit Mode */}
+        {/* Top-Center: Proportional Editing HUD & Contextual Edge Topology Sub-tool in Edit Mode */}
         {workMode === 'edit' && !operatorSession && (
           <ProportionalEditingBar
             config={settings.proportionalEditing}
@@ -578,7 +752,54 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
             onToggleConnectedOnly={onToggleProportionalConnected}
             onChangeFalloff={onChangeProportionalFalloff}
             onChangeRadius={onChangeProportionalRadius}
-          />
+          >
+            {editSelectionMode === 'edge' && onChangeEdgeSelectionTool && (
+              <div
+                className="pointer-events-auto flex items-center gap-0.5 p-0.5 rounded-lg bg-[#181a1f]/95 border border-[#343a47] shadow-lg"
+                title="Modo de selección de aristas al tocar"
+              >
+                <span className="px-1.5 text-[10px] font-semibold uppercase tracking-wide text-[#8e95a5]">
+                  Sel. Arista
+                </span>
+                {(
+                  [
+                    { id: 'single', label: 'Arista' },
+                    { id: 'loop', label: 'Bucle' },
+                    { id: 'ring', label: 'Anillo' },
+                  ] as const
+                ).map((item) => {
+                  const active = edgeSelectionTool === item.id;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => onChangeEdgeSelectionTool(item.id)}
+                      className={`px-2 py-1 rounded text-[11px] font-medium transition-colors ${
+                        active
+                          ? 'bg-[#ff9900] text-[#111215] font-semibold'
+                          : 'text-[#d1d5db] hover:bg-[#2a2f3a]'
+                      }`}
+                    >
+                      {item.label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </ProportionalEditingBar>
+        )}
+
+        {/* Active CTRL + Drag Virtual Trackball HUD Indicator */}
+        {trackballActive && (
+          <div
+            data-testid="trackball-active-indicator"
+            className="absolute top-3 left-3 z-20 px-2.5 py-1.5 rounded-lg bg-[#122536] border border-[#38bdf8] text-[#7dd3fc] text-[11px] font-semibold flex items-center gap-1.5 shadow-lg pointer-events-none"
+          >
+            <Rotate3d className="w-3.5 h-3.5 text-[#38bdf8]" />
+            <span>
+              Rotación Trackball ({workMode === 'edit' ? 'Edición' : 'Objeto'})
+            </span>
+          </div>
         )}
 
         {/* Top-Right: Interactive Z-Up Orientation Gizmo */}
@@ -589,18 +810,22 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
           />
         </div>
 
-        {/* ZBrush-inspired Movable Floating Modifiers Panel (SHIFT / CTRL / ALT) */}
+        {/* ZBrush-inspired Movable Floating Modifiers Panel (SHIFT / CTRL / ALT + G) */}
         <FloatingModifierPanel
           containerRef={viewportContainerRef}
           settings={settings.touch}
           effectiveModifiers={effectiveModifiers}
           virtualModifiers={screenModifiers}
+          activeTool={activeTool}
+          modalTransformMode={modalTransform?.mode ?? null}
           onSetModifier={onSetScreenModifier}
           onToggleModifier={onToggleScreenModifier}
           onReleaseAll={onReleaseScreenModifiers}
           onChangeBehaviorMode={(mode) =>
             onUpdateTouchSettings({ modifierPanelMode: mode })
           }
+          onGQuickTapMove={onGQuickTapMove}
+          onGHoldSlide={onGHoldSlide}
         />
 
         {/* Floating Draggable Button & Customizable Radial Menu */}
@@ -609,6 +834,7 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
             containerRef={viewportContainerRef}
             workMode={workMode}
             editSelectionMode={editSelectionMode}
+            edgeSelectionTool={edgeSelectionTool}
             activeTool={activeTool}
             activeOperatorType={null}
             axisConstraint={axisConstraint}
@@ -650,6 +876,8 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
             }
             onToggleWorkMode={onToggleWorkMode}
             onChangeEditSelectionMode={onChangeEditSelectionMode}
+            onChangeEdgeSelectionTool={onChangeEdgeSelectionTool}
+            onSelectEdgeTopology={onSelectEdgeTopology}
             onToggleXray={onToggleXray}
             onToggleFaceOrientation={onToggleFaceOrientation}
             onToggleGrid={onToggleGrid}
@@ -714,6 +942,7 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
             onFocusCamera={() => engineRef.current?.setCameraPreset('focus')}
             onSelectAll={onSelectAll}
             onDeselectAll={onDeselectAll}
+            onSelectEdgeTopology={onSelectEdgeTopology}
             onStartOperator={onStartOperator}
             onFillSelection={onFillSelection}
             onConnectVertexPath={onConnectVertexPath}
@@ -732,6 +961,8 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
           <EditOperatorBar
             session={operatorSession}
             mergedCount={operatorMergedCount}
+            operatorError={operatorError}
+            operatorStatusMessage={operatorStatusMessage}
             loopCutFaceCount={loopCutFaceIds.length}
             loopCutIsClosed={loopCutIsClosed}
             loopCutError={loopCutError}
@@ -739,17 +970,145 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
             onToggleLoopCutSlideActive={() =>
               setLoopCutSlideActive((prev) => !prev)
             }
+            onSwitchMergeOperator={onSwitchMergeOperator}
             onUpdateConfig={onUpdateOperatorConfig}
             onConfirm={onConfirmOperator}
             onCancel={onCancelOperator}
           />
         )}
 
+        {/* CTRL + SHIFT: Add Primitives Menu */}
+        {activeComboMenu === 'primitives' && !operatorSession && (
+          <CtrlShiftPrimitivesMenu
+            onSelectPrimitive={(type) => {
+              onAddPrimitive(type);
+              handleCloseComboMenu();
+            }}
+            onClose={handleCloseComboMenu}
+          />
+        )}
+
+        {/* CTRL + ALT: Special Operations Menu */}
+        {activeComboMenu === 'operations' && !operatorSession && (
+          <CtrlAltOperationsMenu
+            workMode={workMode}
+            hasSelectedObject={Boolean(selectedObject)}
+            canEditSelected={Boolean(
+              selectedObject &&
+                selectedObject.objectType === 'mesh' &&
+                !selectedObject.locked,
+            )}
+            hasSelectedComponents={selectedComponentIds.size > 0}
+            hasFaces={Boolean(selectedObject && selectedObject.mesh.faces.length > 0)}
+            onDuplicateObject={onDuplicateObject}
+            onApplyObjectTransform={onApplyObjectTransform}
+            onCenterObjectOrigin={onCenterObjectOrigin}
+            onSeparateSelectedGeometry={onSeparateSelectedGeometry}
+            onRecalculateNormalsOutside={onRecalculateOutside}
+            onFlipNormals={onFlipNormals}
+            onStartLimitedDissolve={() => onStartOperator('dissolve_limited')}
+            onStartBridgeLoops={() => onStartOperator('bridge_loops')}
+            onClose={handleCloseComboMenu}
+          />
+        )}
+
+        {/* Modal G Move / Slide Live Touch Bar */}
+        {modalTransform && !operatorSession && (
+          <div
+            data-testid="modal-transform-bar"
+            style={{ touchAction: 'none' }}
+            onPointerDown={(e) => e.stopPropagation()}
+            onPointerMove={(e) => e.stopPropagation()}
+            onPointerUp={(e) => e.stopPropagation()}
+            className={`absolute bottom-4 left-1/2 -translate-x-1/2 z-20 px-3 py-1.5 rounded-xl bg-[#181a1f]/95 border shadow-[0_10px_28px_rgba(0,0,0,0.45)] flex flex-wrap items-center justify-center gap-2 max-w-[94vw] ${
+              modalTransform.mode === 'move'
+                ? 'border-[#ff9900]/80'
+                : 'border-[#22d3ee]/80'
+            }`}
+          >
+            <div className="flex items-center gap-1.5">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  modalTransform.mode === 'move' ? 'bg-[#ff9900]' : 'bg-[#22d3ee]'
+                }`}
+              />
+              <span className="text-xs font-bold text-[#f3f4f6] whitespace-nowrap">
+                {modalTransform.mode === 'vertex_slide'
+                  ? 'Vertex Slide'
+                  : modalTransform.mode === 'edge_slide'
+                    ? 'Edge Slide'
+                    : 'Mover (G)'}
+              </span>
+              <span className="text-[11px] font-mono-tabular text-[#9ca3af] whitespace-nowrap">
+                {modalStatus?.active
+                  ? modalStatus.deltaText
+                  : modalTransform.mode === 'move'
+                    ? 'Arrastra para mover'
+                    : 'Arrastra para deslizar'}
+              </span>
+            </div>
+
+            {modalTransform.mode === 'move' ? (
+              <div className="flex items-center gap-1 pl-1 border-l border-[#2e3340]">
+                {(
+                  [
+                    { id: 'free', label: 'Libre', activeClass: 'bg-[#ff9900] text-[#111215]' },
+                    { id: 'x', label: 'X', activeClass: 'bg-[#e05252] text-white' },
+                    { id: 'y', label: 'Y', activeClass: 'bg-[#52b852] text-white' },
+                    { id: 'z', label: 'Z', activeClass: 'bg-[#48bce8] text-[#111215]' },
+                  ] as const
+                ).map((ax) => (
+                  <button
+                    key={ax.id}
+                    type="button"
+                    onClick={() => onChangeAxisConstraint(ax.id)}
+                    className={`px-2 py-1 rounded text-[11px] font-bold transition-colors ${
+                      axisConstraint === ax.id
+                        ? ax.activeClass
+                        : 'bg-[#23262f] text-[#b4bac4] hover:text-white'
+                    }`}
+                  >
+                    {ax.label}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="flex items-center gap-1 pl-1 border-l border-[#2e3340]">
+                <button
+                  type="button"
+                  onClick={() => onChangeModalClamp?.(!modalTransform.clamp)}
+                  className={`px-2 py-1 rounded text-[11px] font-semibold transition-colors ${
+                    modalTransform.clamp
+                      ? 'bg-[#0e2a33] border border-[#22d3ee]/70 text-[#67e8f9]'
+                      : 'bg-[#23262f] border border-[#343a47] text-[#b4bac4] hover:text-white'
+                  }`}
+                  title="Limitar deslizamiento entre los vértices vecinos"
+                >
+                  {modalTransform.clamp ? 'Tope: Sí' : 'Tope: No'}
+                </button>
+              </div>
+            )}
+
+            <button
+              type="button"
+              data-testid="modal-transform-cancel"
+              onClick={() => onCancelModalTransform?.()}
+              className="px-2.5 py-1 rounded-lg bg-[#2c191c] hover:bg-[#3f2024] border border-[#e05252]/60 text-[#fca5a5] text-[11px] font-bold transition-colors"
+            >
+              Cancelar
+            </button>
+          </div>
+        )}
+
         {/* Transient Action Feedback Toast */}
         {toastMessage && (
           <div
             className={`absolute ${
-              operatorSession ? 'bottom-28' : 'bottom-4'
+              operatorSession
+                ? 'bottom-28'
+                : modalTransform
+                  ? 'bottom-16'
+                  : 'bottom-4'
             } left-1/2 -translate-x-1/2 z-20 px-3.5 py-2 rounded-md bg-[#181a1f] border border-[#3a3f4b] text-xs font-medium text-[#f3f4f6] shadow-lg pointer-events-none`}
           >
             {toastMessage}

@@ -28,7 +28,9 @@ import {
   Unlock,
   Box,
   Circle,
+  Cone,
   Cylinder,
+  Torus,
   X,
   ArrowRightLeft,
 } from 'lucide-react';
@@ -175,6 +177,10 @@ function getObjectIcon(obj: SceneObjectData) {
           return <Globe className="w-3.5 h-3.5 text-[#34d399] shrink-0" />;
         case 'cylinder':
           return <Cylinder className="w-3.5 h-3.5 text-[#a78bfa] shrink-0" />;
+        case 'cone':
+          return <Cone className="w-3.5 h-3.5 text-[#fbbf24] shrink-0" />;
+        case 'torus':
+          return <Torus className="w-3.5 h-3.5 text-[#38bdf8] shrink-0" />;
         case 'pyramid':
           return <Pyramid className="w-3.5 h-3.5 text-[#f472b6] shrink-0" />;
         case 'suzanne':

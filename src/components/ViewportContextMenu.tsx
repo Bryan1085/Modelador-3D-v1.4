@@ -9,8 +9,10 @@ import {
   EyeOff,
   FlipHorizontal,
   Focus,
+  GitCommitHorizontal,
   GitMerge,
   Grid,
+  Link2,
   Maximize2,
   Minimize2,
   MousePointer,
@@ -69,6 +71,7 @@ interface ViewportContextMenuProps {
   onSelectAll: () => void;
   onDeselectAll: () => void;
   onStartOperator: (type: EditOperatorType) => void;
+  onSelectEdgeTopology?: (kind: 'loop' | 'ring', targetEdgeId?: string) => void;
   onFillSelection: () => void;
   onConnectVertexPath: () => void;
   onToggleFaceOrientation: () => void;
@@ -116,6 +119,7 @@ export const ViewportContextMenu: React.FC<ViewportContextMenuProps> = ({
   onSelectAll,
   onDeselectAll,
   onStartOperator,
+  onSelectEdgeTopology,
   onFillSelection,
   onConnectVertexPath,
   onToggleFaceOrientation,
@@ -364,6 +368,28 @@ export const ViewportContextMenu: React.FC<ViewportContextMenuProps> = ({
       );
 
       if (editSelectionMode === 'edge') {
+        if (onSelectEdgeTopology) {
+          actions.push(
+            {
+              id: 'select_edge_loop',
+              label: 'Seleccionar Bucle (Loop)',
+              icon: <GitCommitHorizontal className="w-4 h-4 text-[#38bdf8]" />,
+              onSelect: () => {
+                onSelectEdgeTopology('loop', menu.hitComponentId ?? undefined);
+                onClose();
+              },
+            },
+            {
+              id: 'select_edge_ring',
+              label: 'Seleccionar Anillo (Ring)',
+              icon: <Columns className="w-4 h-4 text-[#38bdf8]" />,
+              onSelect: () => {
+                onSelectEdgeTopology('ring', menu.hitComponentId ?? undefined);
+                onClose();
+              },
+            },
+          );
+        }
         actions.push({
           id: 'loop_cut',
           label: 'Corte de bucle',
@@ -405,6 +431,16 @@ export const ViewportContextMenu: React.FC<ViewportContextMenuProps> = ({
       }
 
       actions.push(
+        {
+          id: 'bridge_loops',
+          label: 'Bridge Edge Loops',
+          icon: <Link2 className="w-4 h-4 text-[#38bdf8]" />,
+          disabled: selectedCount < 2,
+          onSelect: () => {
+            onStartOperator('bridge_loops');
+            onClose();
+          },
+        },
         {
           id: 'merge',
           label: 'Fusionar vértices',
@@ -497,6 +533,16 @@ export const ViewportContextMenu: React.FC<ViewportContextMenuProps> = ({
       }
 
       actions.push(
+        {
+          id: 'dissolve_limited',
+          label: 'Limited Dissolve',
+          icon: <ScissorsLineDashed className="w-4 h-4 text-[#38bdf8]" />,
+          dividerAfter: true,
+          onSelect: () => {
+            onStartOperator('dissolve_limited');
+            onClose();
+          },
+        },
         {
           id: 'recalculate_outside',
           label: 'Recalculate Outside',
@@ -591,9 +637,18 @@ export const ViewportContextMenu: React.FC<ViewportContextMenuProps> = ({
           id: 'merge_by_distance_all',
           label: 'Fusionar por distancia',
           icon: <Minimize2 className="w-4 h-4 text-[#ff9900]" />,
-          dividerAfter: true,
           onSelect: () => {
             onStartOperator('merge_by_distance');
+            onClose();
+          },
+        },
+        {
+          id: 'dissolve_limited_all',
+          label: 'Limited Dissolve',
+          icon: <ScissorsLineDashed className="w-4 h-4 text-[#38bdf8]" />,
+          dividerAfter: true,
+          onSelect: () => {
+            onStartOperator('dissolve_limited');
             onClose();
           },
         },
