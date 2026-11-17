@@ -101,6 +101,91 @@ export function selectAllComponents(
   return new Set(mesh.faces.map((f) => f.id));
 }
 
+/**
+ * Expands the current component selection across all topologically connected
+ * vertices, edges, and faces (mesh island selection).
+ */
+export function selectConnectedComponents(
+  mesh: EditableMesh,
+  mode: EditSelectionMode,
+  selectedIds: ReadonlySet<string>,
+): Set<string> {
+  if (selectedIds.size === 0) return new Set();
+
+  const visitedVertices = new Set<string>();
+  const queue: string[] = [];
+
+  const enqueueVertex = (vid: string) => {
+    if (!visitedVertices.has(vid) && mesh.getVertex(vid)) {
+      visitedVertices.add(vid);
+      queue.push(vid);
+    }
+  };
+
+  if (mode === 'vertex') {
+    for (const id of selectedIds) {
+      enqueueVertex(id);
+    }
+  } else if (mode === 'edge') {
+    for (const id of selectedIds) {
+      const edge = mesh.getEdge(id);
+      if (edge) {
+        enqueueVertex(edge.v0);
+        enqueueVertex(edge.v1);
+      }
+    }
+  } else {
+    for (const id of selectedIds) {
+      const face = mesh.getFace(id);
+      if (face) {
+        for (const vid of face.vertexIds) {
+          enqueueVertex(vid);
+        }
+      }
+    }
+  }
+
+  while (queue.length > 0) {
+    const vid = queue.pop()!;
+    for (const neighbor of mesh.getConnectedVertices(vid)) {
+      enqueueVertex(neighbor);
+    }
+    for (const fid of mesh.getFacesForVertex(vid)) {
+      const face = mesh.getFace(fid);
+      if (face) {
+        for (const fvid of face.vertexIds) {
+          enqueueVertex(fvid);
+        }
+      }
+    }
+  }
+
+  if (mode === 'vertex') {
+    return visitedVertices;
+  }
+
+  if (mode === 'edge') {
+    const resultEdges = new Set<string>();
+    for (const edge of mesh.edges) {
+      if (visitedVertices.has(edge.v0) && visitedVertices.has(edge.v1)) {
+        resultEdges.add(edge.id);
+      }
+    }
+    return resultEdges;
+  }
+
+  const resultFaces = new Set<string>();
+  for (const face of mesh.faces) {
+    if (
+      face.vertexIds.length > 0 &&
+      face.vertexIds.every((vid) => visitedVertices.has(vid))
+    ) {
+      resultFaces.add(face.id);
+    }
+  }
+  return resultFaces;
+}
+
 export interface DerivedEditSelection {
   vertexIds: Set<string>;
   edgeIds: Set<string>;

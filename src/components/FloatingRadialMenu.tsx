@@ -1,31 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Aperture,
-  ArrowUpDown,
-  CheckSquare,
-  Columns,
-  Copy,
-  FlipHorizontal,
-  GitMerge,
-  Grid,
-  Layers,
-  Link2,
-  Maximize2,
-  Minimize2,
-  MousePointer,
-  Move,
-  PaintBucket,
   Plus,
-  Redo2,
-  RefreshCw,
-  RotateCw,
-  Scissors,
-  ScissorsLineDashed,
   SlidersHorizontal,
-  Square,
-  Trash2,
-  Undo2,
-  Waypoints,
   X,
 } from 'lucide-react';
 import {
@@ -51,9 +28,7 @@ import {
 } from '../core/radial/radialActions';
 import { CameraPreset } from '../engine/ViewportEngine';
 import { EditOperatorType } from '../state/useModelerStore';
-import { DeleteMenuPopover } from './DeleteMenuPopover';
 import { PrimitiveMenu } from './PrimitiveMenu';
-import { ProportionalIcon } from './ProportionalEditingBar';
 import { RadialActionIcon } from './RadialActionIcon';
 import { RadialSlotEditorModal } from './RadialSlotEditorModal';
 
@@ -200,7 +175,6 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [showPrimitivePicker, setShowPrimitivePicker] = useState(false);
-  const [showDeletePicker, setShowDeletePicker] = useState(false);
   const [customizeMode, setCustomizeMode] = useState(false);
   const [editingSlotIndex, setEditingSlotIndex] = useState<number | null>(null);
   const [viewportSize, setViewportSize] = useState({ width: 800, height: 600 });
@@ -244,7 +218,6 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
 
   useEffect(() => {
     setShowPrimitivePicker(false);
-    setShowDeletePicker(false);
   }, [workMode]);
 
   useEffect(() => {
@@ -328,23 +301,6 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
       ),
     };
   }, [btnSize, buttonPos, effectiveRadius, viewportSize]);
-
-  const dockPlacement = useMemo(() => {
-    const dockWidth = Math.min(520, viewportSize.width - 24);
-    const estHeight = workMode === 'edit' ? 128 : 92;
-    const left = Math.max(
-      12,
-      Math.min(viewportSize.width - dockWidth - 12, wheelCenter.x - dockWidth / 2),
-    );
-    const belowY = wheelCenter.y + effectiveRadius + 44;
-    const canPlaceBelow = belowY + estHeight <= viewportSize.height - 10;
-    const aboveY = Math.max(10, wheelCenter.y - effectiveRadius - 40 - estHeight);
-    return {
-      left,
-      top: canPlaceBelow ? belowY : aboveY,
-      width: dockWidth,
-    };
-  }, [effectiveRadius, viewportSize.height, viewportSize.width, wheelCenter, workMode]);
 
   const quickDeleteAction: DeleteActionType =
     editSelectionMode === 'vertex'
@@ -507,7 +463,6 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
 
   const closeAll = () => {
     setShowPrimitivePicker(false);
-    setShowDeletePicker(false);
     setCustomizeMode(false);
     setIsOpen(false);
   };
@@ -599,7 +554,6 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
         closeAll();
         break;
       case 'open_add_menu':
-        setShowDeletePicker(false);
         setShowPrimitivePicker((prev) => !prev);
         break;
       case 'add_plane':
@@ -832,7 +786,6 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
     }
 
     setShowPrimitivePicker(false);
-    setShowDeletePicker(false);
     setCustomizeMode(false);
     setIsOpen((prev) => !prev);
   };
@@ -856,7 +809,6 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
         slotHoldRef.current.triggered = true;
         slotHoldRef.current.timer = null;
         setShowPrimitivePicker(false);
-        setShowDeletePicker(false);
         setEditingSlotIndex(slotIndex);
       }
     }, SLOT_LONG_PRESS_MS);
@@ -884,33 +836,6 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
   };
 
   const slots = radialLayouts[activeRadialMode];
-
-  const transformTools: {
-    id: TransformTool;
-    label: string;
-    icon: React.ReactNode;
-  }[] = [
-    { id: 'select', label: 'Selec.', icon: <MousePointer className="w-3.5 h-3.5" /> },
-    { id: 'move', label: 'Mover', icon: <Move className="w-3.5 h-3.5" /> },
-    { id: 'rotate', label: 'Rotar', icon: <RotateCw className="w-3.5 h-3.5" /> },
-    { id: 'scale', label: 'Escalar', icon: <Maximize2 className="w-3.5 h-3.5" /> },
-  ];
-
-  const meshQuickOps: {
-    id: EditOperatorType;
-    label: string;
-    icon: React.ReactNode;
-  }[] = [
-    { id: 'extrude', label: 'Extruir', icon: <FlipHorizontal className="w-3.5 h-3.5" /> },
-    { id: 'inset', label: 'Insertar', icon: <Square className="w-3.5 h-3.5" /> },
-    { id: 'subdivide', label: 'Subdiv.', icon: <Grid className="w-3.5 h-3.5" /> },
-    { id: 'bevel', label: 'Biselar', icon: <Columns className="w-3.5 h-3.5" /> },
-    { id: 'loop_cut', label: 'Bucle', icon: <Scissors className="w-3.5 h-3.5" /> },
-    { id: 'merge', label: 'Fusionar', icon: <GitMerge className="w-3.5 h-3.5" /> },
-    { id: 'merge_by_distance', label: 'Dist.', icon: <Minimize2 className="w-3.5 h-3.5" /> },
-    { id: 'bridge_loops', label: 'Bridge', icon: <Link2 className="w-3.5 h-3.5" /> },
-    { id: 'dissolve_limited', label: 'Lim. Diss.', icon: <ScissorsLineDashed className="w-3.5 h-3.5" /> },
-  ];
 
   return (
     <>
@@ -1006,7 +931,6 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
                       }
                       if (customizeMode || !def) {
                         setShowPrimitivePicker(false);
-                        setShowDeletePicker(false);
                         setEditingSlotIndex(idx);
                         return;
                       }
@@ -1064,7 +988,6 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
                   type="button"
                   onClick={() => {
                     setShowPrimitivePicker(false);
-                    setShowDeletePicker(false);
                     setCustomizeMode((prev) => !prev);
                   }}
                   className={`h-7 px-2.5 rounded-md border text-[10px] font-semibold whitespace-nowrap flex items-center gap-1 shadow-md transition-colors ${
@@ -1081,383 +1004,7 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
             </div>
           </div>
 
-          {/* Contextual Quick Tools, Axis Constraints & Edit Helpers Dock (Replaces legacy left ToolPanel + top-left axis bar) */}
-          <div
-            style={{
-              left: dockPlacement.left,
-              top: dockPlacement.top,
-              width: dockPlacement.width,
-            }}
-            onPointerDown={(e) => e.stopPropagation()}
-            className="absolute z-30 rounded-xl bg-[#181a1f]/95 border border-[#343a47] shadow-2xl p-2 space-y-1.5"
-          >
-            {/* Row 1: Transform Tools + Axis Constraint (Libre/X/Y/Z) + Undo/Redo */}
-            <div className="flex flex-wrap items-center justify-between gap-1.5">
-              <div className="flex items-center gap-1">
-                {transformTools.map((tool) => {
-                  const active = activeTool === tool.id && !activeOperatorType;
-                  return (
-                    <button
-                      key={tool.id}
-                      type="button"
-                      onClick={() => {
-                        onSelectTool(tool.id);
-                        closeAll();
-                      }}
-                      className={`h-9 px-2.5 rounded-lg border text-[11px] font-semibold flex items-center gap-1 transition-colors touch-manipulation ${
-                        active
-                          ? 'bg-[#2c313b] border-[#ff9900]/70 text-[#ff9900]'
-                          : 'bg-[#21242c] hover:bg-[#2a2e38] border-[#303542] text-[#d1d5db]'
-                      }`}
-                    >
-                      {tool.icon}
-                      <span className="hidden sm:inline">{tool.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
-
-              {/* Transform Axis Constraint: Libre | X | Y | Z */}
-              <div
-                className="flex items-center p-0.5 rounded-lg bg-[#111317] border border-[#2c303a]"
-                aria-label="Restricción de eje de transformación"
-              >
-                {(
-                  [
-                    { id: 'free', label: 'Libre', color: 'text-[#e4e6eb]' },
-                    { id: 'x', label: 'X', color: 'text-[#e05252]' },
-                    { id: 'y', label: 'Y', color: 'text-[#52b852]' },
-                    { id: 'z', label: 'Z', color: 'text-[#48bce8]' },
-                  ] as const
-                ).map((ax) => {
-                  const active = axisConstraint === ax.id;
-                  return (
-                    <button
-                      key={ax.id}
-                      type="button"
-                      onClick={() => onChangeAxisConstraint(ax.id)}
-                      className={`h-8 px-2.5 rounded-md text-[11px] font-semibold transition-colors touch-manipulation ${
-                        active
-                          ? `bg-[#2c313b] ${ax.color} border border-[#464c5a]`
-                          : 'text-[#9ca3af] hover:text-white border border-transparent'
-                      }`}
-                    >
-                      {ax.label}
-                    </button>
-                  );
-                })}
-              </div>
-
-              <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  disabled={!canUndo}
-                  onClick={() => {
-                    onUndo();
-                    closeAll();
-                  }}
-                  title="Deshacer"
-                  aria-label="Deshacer"
-                  className="h-9 w-9 rounded-lg bg-[#21242c] hover:bg-[#2a2e38] disabled:opacity-35 disabled:pointer-events-none border border-[#303542] text-[#e4e6eb] flex items-center justify-center"
-                >
-                  <Undo2 className="w-4 h-4" />
-                </button>
-                <button
-                  type="button"
-                  disabled={!canRedo}
-                  onClick={() => {
-                    onRedo();
-                    closeAll();
-                  }}
-                  title="Rehacer"
-                  aria-label="Rehacer"
-                  className="h-9 w-9 rounded-lg bg-[#21242c] hover:bg-[#2a2e38] disabled:opacity-35 disabled:pointer-events-none border border-[#303542] text-[#e4e6eb] flex items-center justify-center"
-                >
-                  <Redo2 className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-
-            {/* Row 2: Mode-specific actions (Object: Add / Duplicate / Delete | Edit: Submodes / Ops / Selection) */}
-            {workMode === 'object' ? (
-              <div className="flex flex-wrap items-center justify-between gap-1.5 pt-1.5 border-t border-[#272b34]">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowDeletePicker(false);
-                    setShowPrimitivePicker((prev) => !prev);
-                  }}
-                  className={`h-9 px-3 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors touch-manipulation ${
-                    showPrimitivePicker
-                      ? 'bg-[#ff9900] text-[#111215]'
-                      : 'bg-[#d97706] hover:bg-[#e5840b] text-[#111215]'
-                  }`}
-                >
-                  <Plus className="w-4 h-4" />
-                  <span>Agregar objeto</span>
-                </button>
-
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    disabled={!hasSelectedObject}
-                    onClick={() => {
-                      onDuplicateObject();
-                      closeAll();
-                    }}
-                    className="h-9 px-2.5 rounded-lg bg-[#21242c] hover:bg-[#2a2e38] disabled:opacity-35 disabled:pointer-events-none border border-[#303542] text-[11px] font-medium text-[#e4e6eb] flex items-center gap-1.5"
-                  >
-                    <Copy className="w-3.5 h-3.5 text-[#ff9900]" />
-                    <span>Duplicar</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!hasSelectedObject}
-                    onClick={() => {
-                      onDeleteObject();
-                      closeAll();
-                    }}
-                    className="h-9 px-2.5 rounded-lg bg-[#271b1e] hover:bg-[#3a2226] disabled:opacity-35 disabled:pointer-events-none border border-[#4a2b31] text-[11px] font-medium text-[#f87171] flex items-center gap-1.5"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    <span>Eliminar</span>
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="space-y-1.5 pt-1.5 border-t border-[#272b34]">
-                {/* Edit Submodes + Selection Actions */}
-                <div className="flex flex-wrap items-center justify-between gap-1.5">
-                  <div className="flex items-center p-0.5 rounded-lg bg-[#111317] border border-[#2c303a]">
-                    {(
-                      [
-                        { id: 'vertex', label: 'Vértices' },
-                        { id: 'edge', label: 'Aristas' },
-                        { id: 'face', label: 'Caras' },
-                      ] as const
-                    ).map((sub) => (
-                      <button
-                        key={sub.id}
-                        type="button"
-                        onClick={() => onChangeEditSelectionMode(sub.id)}
-                        className={`h-8 px-2.5 rounded-md text-[11px] font-semibold transition-colors touch-manipulation ${
-                          editSelectionMode === sub.id
-                            ? 'bg-[#2c313b] text-[#ff9900]'
-                            : 'text-[#9ca3af] hover:text-white'
-                        }`}
-                      >
-                        {sub.label}
-                      </button>
-                    ))}
-                  </div>
-
-                  {editSelectionMode === 'edge' && onChangeEdgeSelectionTool && (
-                    <div className="flex items-center p-0.5 rounded-lg bg-[#111317] border border-[#2c303a]">
-                      {(
-                        [
-                          { id: 'single', label: 'Arista' },
-                          { id: 'loop', label: 'Bucle' },
-                          { id: 'ring', label: 'Anillo' },
-                        ] as const
-                      ).map((toolOpt) => (
-                        <button
-                          key={toolOpt.id}
-                          type="button"
-                          onClick={() => onChangeEdgeSelectionTool(toolOpt.id)}
-                          className={`h-8 px-2 rounded-md text-[11px] font-semibold transition-colors touch-manipulation ${
-                            edgeSelectionTool === toolOpt.id
-                              ? 'bg-[#1a2c3d] text-[#38bdf8]'
-                              : 'text-[#9ca3af] hover:text-white'
-                          }`}
-                        >
-                          {toolOpt.label}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-
-                  <div className="flex items-center gap-1">
-                    <button
-                      type="button"
-                      onClick={() => onToggleMultiSelectTouch()}
-                      className={`h-8 px-2 rounded-lg border text-[11px] font-medium flex items-center gap-1 transition-colors ${
-                        multiSelectTouch
-                          ? 'bg-[#2c313b] border-[#ff9900]/60 text-[#ff9900]'
-                          : 'bg-[#21242c] border-[#303542] text-[#b4bac4] hover:text-white'
-                      }`}
-                    >
-                      <Layers className="w-3.5 h-3.5" />
-                      <span>Múltiple</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        onSelectAll();
-                        closeAll();
-                      }}
-                      className="h-8 px-2 rounded-lg bg-[#21242c] hover:bg-[#2a2e38] border border-[#303542] text-[11px] font-medium text-[#d1d5db] flex items-center gap-1"
-                    >
-                      <CheckSquare className="w-3.5 h-3.5" />
-                      <span>Todo</span>
-                    </button>
-                    <button
-                      type="button"
-                      disabled={!hasSelectedComponents}
-                      onClick={() => {
-                        onDeselectAll();
-                        closeAll();
-                      }}
-                      className="h-8 px-2 rounded-lg bg-[#21242c] hover:bg-[#2a2e38] disabled:opacity-35 disabled:pointer-events-none border border-[#303542] text-[11px] font-medium text-[#d1d5db]"
-                    >
-                      Limpiar
-                    </button>
-                  </div>
-                </div>
-
-                {/* Mesh Modeling Operators + Contextual Delete */}
-                <div className="flex flex-wrap items-center gap-1">
-                  {meshQuickOps.map((op) => (
-                    <button
-                      key={op.id}
-                      type="button"
-                      onClick={() => {
-                        onStartOperator(op.id);
-                        closeAll();
-                      }}
-                      className="h-8 px-2 rounded-lg bg-[#21242c] hover:bg-[#2c313b] border border-[#303542] text-[11px] font-medium text-[#e4e6eb] flex items-center gap-1 touch-manipulation"
-                    >
-                      <span className="text-[#ff9900]">{op.icon}</span>
-                      <span>{op.label}</span>
-                    </button>
-                  ))}
-                  <button
-                    type="button"
-                    disabled={!hasSelectedComponents}
-                    onClick={() => {
-                      onFillSelection();
-                      closeAll();
-                    }}
-                    className="h-8 px-2 rounded-lg bg-[#21242c] hover:bg-[#2c313b] disabled:opacity-35 disabled:pointer-events-none border border-[#303542] text-[11px] font-medium text-[#e4e6eb] flex items-center gap-1 touch-manipulation"
-                  >
-                    <PaintBucket className="w-3.5 h-3.5 text-[#ff9900]" />
-                    <span>Crear cara</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={
-                      editSelectionMode !== 'vertex' || !hasSelectedComponents
-                    }
-                    onClick={() => {
-                      onConnectVertexPath();
-                      closeAll();
-                    }}
-                    title="Connect Vertex Path (J)"
-                    className="h-8 px-2 rounded-lg bg-[#21242c] hover:bg-[#2c313b] disabled:opacity-35 disabled:pointer-events-none border border-[#303542] text-[11px] font-medium text-[#e4e6eb] flex items-center gap-1 touch-manipulation"
-                  >
-                    <Waypoints className="w-3.5 h-3.5 text-[#38bdf8]" />
-                    <span>Conectar (J)</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!hasSelectedComponents}
-                    onClick={() => {
-                      setShowPrimitivePicker(false);
-                      setShowDeletePicker((prev) => !prev);
-                    }}
-                    className={`h-8 px-2 rounded-lg border text-[11px] font-medium flex items-center gap-1 touch-manipulation ${
-                      showDeletePicker
-                        ? 'bg-[#352024] border-[#e06c75]/60 text-[#ff8b94]'
-                        : 'bg-[#271b1e] hover:bg-[#352024] border-[#4a2b31] text-[#f87171]'
-                    } disabled:opacity-35 disabled:pointer-events-none`}
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    <span>Eliminar...</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onToggleFaceOrientation();
-                      closeAll();
-                    }}
-                    title="Face Orientation (Azul: exterior · Rojo: invertida)"
-                    className={`h-8 px-2 rounded-lg border text-[11px] font-medium flex items-center gap-1.5 touch-manipulation ${
-                      showFaceOrientation
-                        ? 'bg-[#2c313b] border-[#3b82f6]/75 text-[#93c5fd]'
-                        : 'bg-[#21242c] hover:bg-[#2c313b] border-[#303542] text-[#e4e6eb]'
-                    }`}
-                  >
-                    <span
-                      className="inline-flex w-3.5 h-3.5 rounded-sm overflow-hidden border border-white/25 shrink-0"
-                      aria-hidden="true"
-                    >
-                      <span className="w-1/2 h-full bg-[#2563eb]" />
-                      <span className="w-1/2 h-full bg-[#e03131]" />
-                    </span>
-                    <span>Face Orientation</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onRecalculateOutside();
-                      closeAll();
-                    }}
-                    title="Recalculate Outside"
-                    className="h-8 px-2 rounded-lg bg-[#21242c] hover:bg-[#2c313b] border border-[#303542] text-[11px] font-medium text-[#e4e6eb] flex items-center gap-1 touch-manipulation"
-                  >
-                    <RefreshCw className="w-3.5 h-3.5 text-[#60a5fa]" />
-                    <span>Recalculate Outside</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onFlipNormals();
-                      closeAll();
-                    }}
-                    title="Flip Normals"
-                    className="h-8 px-2 rounded-lg bg-[#21242c] hover:bg-[#2c313b] border border-[#303542] text-[11px] font-medium text-[#e4e6eb] flex items-center gap-1 touch-manipulation"
-                  >
-                    <ArrowUpDown className="w-3.5 h-3.5 text-[#f87171]" />
-                    <span>Flip Normals</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onToggleProportional();
-                      closeAll();
-                    }}
-                    title="Edición Proporcional (O)"
-                    className={`h-8 px-2 rounded-lg border text-[11px] font-medium flex items-center gap-1 touch-manipulation ${
-                      proportionalEnabled
-                        ? 'bg-[#2a1f10] border-[#ff9900] text-[#ffb84d]'
-                        : 'bg-[#21242c] hover:bg-[#2c313b] border-[#303542] text-[#e4e6eb]'
-                    }`}
-                  >
-                    <ProportionalIcon className="w-3.5 h-3.5" />
-                    <span>Proporcional (O)</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!proportionalEnabled}
-                    onClick={() => {
-                      onToggleProportionalConnected();
-                      closeAll();
-                    }}
-                    title="Solo Conectados (Alt+O)"
-                    className={`h-8 px-2 rounded-lg border text-[11px] font-medium flex items-center gap-1 touch-manipulation disabled:opacity-35 disabled:pointer-events-none ${
-                      proportionalConnectedOnly && proportionalEnabled
-                        ? 'bg-[#132638] border-[#38bdf8] text-[#7dd3fc]'
-                        : 'bg-[#21242c] hover:bg-[#2c313b] border-[#303542] text-[#e4e6eb]'
-                    }`}
-                  >
-                    <Link2 className="w-3.5 h-3.5" />
-                    <span>Conectados</span>
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Full Primitive Menu Popover (with Cubo, Círculo, Esfera UV, Cilindro, Pirámide & resolution controls) */}
+          {/* Full Primitive Menu Popover (triggered from Radial 'open_add_menu' slot) */}
           {showPrimitivePicker && workMode === 'object' && (
             <div
               style={{
@@ -1476,37 +1023,6 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
                   closeAll();
                 }}
                 onClose={() => setShowPrimitivePicker(false)}
-              />
-            </div>
-          )}
-
-          {/* Contextual Edit Delete/Dissolve Popover */}
-          {showDeletePicker && workMode === 'edit' && (
-            <div
-              style={{
-                left: Math.max(
-                  12,
-                  Math.min(viewportSize.width - 268, wheelCenter.x - 128),
-                ),
-                top: Math.max(
-                  12,
-                  Math.min(viewportSize.height - 230, dockPlacement.top - 10),
-                ),
-              }}
-              onPointerDown={(e) => e.stopPropagation()}
-              className="absolute z-40"
-            >
-              <DeleteMenuPopover
-                editSelectionMode={editSelectionMode}
-                onSelectAction={(action) => {
-                  onExecuteContextualDelete(action);
-                  closeAll();
-                }}
-                onLimitedDissolve={() => {
-                  onStartOperator('dissolve_limited');
-                  closeAll();
-                }}
-                onClose={() => setShowDeletePicker(false)}
               />
             </div>
           )}

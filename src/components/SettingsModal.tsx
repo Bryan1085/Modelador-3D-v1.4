@@ -1,36 +1,61 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Aperture,
   ArrowBigUpDash,
+  Columns,
+  FlipHorizontal,
+  Grid,
   Hand,
   Info,
+  Maximize2,
+  Minimize2,
   MousePointerClick,
+  Move,
   Plus,
   RotateCcw,
+  RotateCw,
+  Scissors,
+  ScissorsLineDashed,
   Sliders,
+  Square,
+  Wrench,
   X,
 } from 'lucide-react';
 import {
+  ConfigurableToolKey,
+  ExtrudeDefaultAxis,
   FloatingMenuCorner,
   FloatingMenuSize,
   ModelerSettings,
+  MoveSubMode,
+  ToolConfigurations,
   TouchControlSettings,
   TouchModifierKey,
   TouchModifierSlotConfig,
 } from '../core/project/types';
+import {
+  clampProportionalRadius,
+  PROPORTIONAL_FALLOFF_LIST,
+  ProportionalEditingSettings,
+} from '../core/mesh/proportionalEditing';
 import {
   RADIAL_ACTION_MAP,
   RadialActionId,
   RadialWorkMode,
 } from '../core/radial/radialActions';
 import { TOUCH_MODIFIER_REGISTRY } from '../engine/TouchGestureManager';
+import type { ToolResetTarget } from '../state/useModelerStore';
+import { ProportionalIcon } from './ProportionalEditingBar';
 import { RadialActionIcon } from './RadialActionIcon';
 import { RadialSlotEditorModal } from './RadialSlotEditorModal';
 import type { SceneStatsInfo } from './TopBar';
 
+export type SettingsTabId = 'touch' | 'viewer' | 'tools';
+
 interface SettingsModalProps {
   settings: ModelerSettings;
   sceneStats?: SceneStatsInfo;
+  initialTab?: SettingsTabId;
   onUpdateSettings: (patch: Partial<ModelerSettings>) => void;
   onUpdateTouchSettings: (patch: Partial<TouchControlSettings>) => void;
   onUpdateTouchModifier: (
@@ -45,12 +70,96 @@ interface SettingsModalProps {
   onResetRadialSlot: (mode: RadialWorkMode, slotIndex: number) => void;
   onResetRadialLayout: (mode: RadialWorkMode) => void;
   onResetTouchSettings: () => void;
+  onUpdateToolConfig: <K extends ConfigurableToolKey>(
+    toolKey: K,
+    patch: Partial<ToolConfigurations[K]>,
+  ) => void;
+  onUpdateProportionalSettings: (
+    patch: Partial<ProportionalEditingSettings>,
+  ) => void;
+  onResetToolConfig: (target: ToolResetTarget) => void;
+  onResetAllToolConfigs: () => void;
   onClose: () => void;
 }
+
+const TOOL_CATALOG: {
+  id: ToolResetTarget;
+  label: string;
+  subtitle: string;
+  icon: React.ReactNode;
+}[] = [
+  {
+    id: 'extrude',
+    label: 'Extruir',
+    subtitle: 'Distancia, dirección y caras individuales',
+    icon: <FlipHorizontal className="w-4 h-4 text-[#ff9900]" />,
+  },
+  {
+    id: 'bevel',
+    label: 'Biselar',
+    subtitle: 'Ancho, segmentos, perfil y solapamiento',
+    icon: <Columns className="w-4 h-4 text-[#ff9900]" />,
+  },
+  {
+    id: 'subdivide',
+    label: 'Subdividir',
+    subtitle: 'Cortes, suavizado y fractal',
+    icon: <Grid className="w-4 h-4 text-[#ff9900]" />,
+  },
+  {
+    id: 'inset',
+    label: 'Insertar',
+    subtitle: 'Grosor, profundidad e individual',
+    icon: <Square className="w-4 h-4 text-[#ff9900]" />,
+  },
+  {
+    id: 'loopCut',
+    label: 'Corte Bucle',
+    subtitle: 'Cortes iniciales y desplazamiento',
+    icon: <Scissors className="w-4 h-4 text-[#38bdf8]" />,
+  },
+  {
+    id: 'mergeByDistance',
+    label: 'Fusionar por dist.',
+    subtitle: 'Umbral de distancia predeterminado',
+    icon: <Minimize2 className="w-4 h-4 text-[#ff9900]" />,
+  },
+  {
+    id: 'dissolveLimited',
+    label: 'Limitar disolución',
+    subtitle: 'Ángulo límite y disolución de vértices',
+    icon: <ScissorsLineDashed className="w-4 h-4 text-[#38bdf8]" />,
+  },
+  {
+    id: 'move',
+    label: 'Mover',
+    subtitle: 'Modo inicial y paso de snap',
+    icon: <Move className="w-4 h-4 text-[#ff9900]" />,
+  },
+  {
+    id: 'rotate',
+    label: 'Rotar',
+    subtitle: 'Ángulo de snap incremental',
+    icon: <RotateCw className="w-4 h-4 text-[#ff9900]" />,
+  },
+  {
+    id: 'scale',
+    label: 'Escalar',
+    subtitle: 'Incremento de snap al escalar',
+    icon: <Maximize2 className="w-4 h-4 text-[#ff9900]" />,
+  },
+  {
+    id: 'proportional',
+    label: 'Ed. proporcional',
+    subtitle: 'Estado, conectados, curva y radio',
+    icon: <ProportionalIcon className="w-4 h-4 text-[#ff9900]" />,
+  },
+];
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   settings,
   sceneStats,
+  initialTab = 'touch',
   onUpdateSettings,
   onUpdateTouchSettings,
   onUpdateTouchModifier,
@@ -58,12 +167,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onResetRadialSlot,
   onResetRadialLayout,
   onResetTouchSettings,
+  onUpdateToolConfig,
+  onUpdateProportionalSettings,
+  onResetToolConfig,
+  onResetAllToolConfigs,
   onClose,
 }) => {
-  const [activeTab, setActiveTab] = useState<'viewer' | 'touch'>('touch');
+  const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
+  const [selectedToolId, setSelectedToolId] =
+    useState<ToolResetTarget>('extrude');
   const [radialEditorMode, setRadialEditorMode] =
     useState<RadialWorkMode>('object');
   const [editingSlotIndex, setEditingSlotIndex] = useState<number | null>(null);
+
+  useEffect(() => {
+    setActiveTab(initialTab);
+  }, [initialTab]);
 
   const renderSwitch = (
     active: boolean,
@@ -176,14 +295,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   ];
 
   const currentModeSlots = settings.touch.radialLayouts[radialEditorMode];
+  const selectedToolMeta =
+    TOOL_CATALOG.find((t) => t.id === selectedToolId) ?? TOOL_CATALOG[0];
 
   return (
     <div className="fixed inset-0 z-50 bg-black/65 flex items-center justify-center p-4">
-      <div className="w-full max-w-xl max-h-[90vh] bg-[#1c1e24] border border-[#323640] rounded-xl shadow-2xl overflow-hidden flex flex-col">
+      <div className="w-full max-w-2xl max-h-[90vh] bg-[#1c1e24] border border-[#323640] rounded-xl shadow-2xl overflow-hidden flex flex-col">
         {/* Modal Header */}
         <div className="px-4 py-3 border-b border-[#2b2e36] flex items-center justify-between shrink-0">
           <h2 className="text-sm font-semibold text-[#f3f4f6]">
-            Configuración y Controles Táctiles
+            Configuración de Forma3D Studio
           </h2>
           <button
             type="button"
@@ -197,11 +318,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         {/* Section Tabs */}
         <div className="px-4 pt-3 shrink-0">
-          <div className="grid grid-cols-2 gap-1 p-1 rounded-lg bg-[#13151a] border border-[#2b2e36]">
+          <div className="grid grid-cols-3 gap-1 p-1 rounded-lg bg-[#13151a] border border-[#2b2e36]">
             <button
               type="button"
+              data-testid="settings-tab-tools"
+              onClick={() => setActiveTab('tools')}
+              className={`h-9 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap ${
+                activeTab === 'tools'
+                  ? 'bg-[#2c313b] text-[#ff9900]'
+                  : 'text-[#9ca3af] hover:text-white'
+              }`}
+            >
+              <Wrench className="w-3.5 h-3.5" />
+              <span>Herramientas</span>
+            </button>
+            <button
+              type="button"
+              data-testid="settings-tab-touch"
               onClick={() => setActiveTab('touch')}
-              className={`h-9 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors ${
+              className={`h-9 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap ${
                 activeTab === 'touch'
                   ? 'bg-[#2c313b] text-[#ff9900]'
                   : 'text-[#9ca3af] hover:text-white'
@@ -212,8 +347,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </button>
             <button
               type="button"
+              data-testid="settings-tab-viewer"
               onClick={() => setActiveTab('viewer')}
-              className={`h-9 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors ${
+              className={`h-9 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap ${
                 activeTab === 'viewer'
                   ? 'bg-[#2c313b] text-[#ff9900]'
                   : 'text-[#9ca3af] hover:text-white'
@@ -227,7 +363,846 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         {/* Scrollable Content */}
         <div className="p-4 overflow-y-auto cad-scroll space-y-4">
-          {activeTab === 'viewer' ? (
+          {activeTab === 'tools' ? (
+            <div
+              data-testid="tool-settings-section"
+              className="flex flex-col sm:flex-row gap-3"
+            >
+              {/* Master List: Tool Selector */}
+              <div className="sm:w-48 shrink-0 flex sm:flex-col gap-1 overflow-x-auto sm:overflow-visible pb-1 sm:pb-0 cad-scroll">
+                {TOOL_CATALOG.map((tool) => {
+                  const active = selectedToolId === tool.id;
+                  return (
+                    <button
+                      key={tool.id}
+                      type="button"
+                      data-testid={`tool-config-item-${tool.id}`}
+                      onClick={() => setSelectedToolId(tool.id)}
+                      className={`min-h-[40px] px-2.5 py-2 rounded-lg border text-left flex items-center gap-2 shrink-0 transition-colors whitespace-nowrap sm:whitespace-normal ${
+                        active
+                          ? 'bg-[#2a2f3a] border-[#ff9900]/75 text-[#f3f4f6]'
+                          : 'bg-[#15171c] hover:bg-[#1f222a] border-[#292d38] text-[#b4bac4]'
+                      }`}
+                    >
+                      <span className="shrink-0">{tool.icon}</span>
+                      <span className="text-xs font-semibold leading-tight">
+                        {tool.label}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Detail Panel: Selected Tool Configuration Only */}
+              <div className="flex-1 min-w-0 rounded-lg bg-[#15171c] border border-[#2b2e36] p-3.5 flex flex-col justify-between gap-4">
+                <div className="space-y-4">
+                  <div className="flex items-start justify-between gap-2 pb-2.5 border-b border-[#262a33]">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="w-8 h-8 rounded-md bg-[#1f222a] border border-[#303542] flex items-center justify-center shrink-0">
+                        {selectedToolMeta.icon}
+                      </span>
+                      <div className="min-w-0">
+                        <h3 className="text-sm font-semibold text-[#f3f4f6]">
+                          {selectedToolMeta.label}
+                        </h3>
+                        <p className="text-[11px] text-[#8e95a2]">
+                          {selectedToolMeta.subtitle}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {selectedToolId === 'extrude' && (
+                    <div className="space-y-3">
+                      <label className="block space-y-1">
+                        <span className="text-xs font-medium text-[#eceef2]">
+                          Distancia predeterminada
+                        </span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          data-testid="config-extrude-distance"
+                          value={settings.toolConfigs.extrude.defaultDistance}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            if (Number.isFinite(v)) {
+                              onUpdateToolConfig('extrude', {
+                                defaultDistance: v,
+                              });
+                            }
+                          }}
+                          className="w-full h-10 px-2.5 rounded-md bg-[#111317] border border-[#2f333d] text-xs font-mono-tabular text-[#f3f4f6] focus:outline-none focus:border-[#ff9900]"
+                        />
+                        <span className="block text-[10px] text-[#8e95a2]">
+                          Acepta valores positivos o negativos sin límite artificial (por defecto: 0.01).
+                        </span>
+                      </label>
+
+                      <div className="space-y-1.5">
+                        <span className="block text-xs font-medium text-[#eceef2]">
+                          Dirección predeterminada
+                        </span>
+                        <div className="grid grid-cols-4 gap-1.5">
+                          {(
+                            [
+                              { id: 'normal', label: 'Normal' },
+                              { id: 'x', label: 'X' },
+                              { id: 'y', label: 'Y' },
+                              { id: 'z', label: 'Z' },
+                            ] as { id: ExtrudeDefaultAxis; label: string }[]
+                          ).map((ax) => (
+                            <button
+                              key={ax.id}
+                              type="button"
+                              onClick={() =>
+                                onUpdateToolConfig('extrude', {
+                                  defaultAxis: ax.id,
+                                })
+                              }
+                              className={`h-9 rounded-md border text-xs font-semibold transition-colors ${
+                                settings.toolConfigs.extrude.defaultAxis === ax.id
+                                  ? 'bg-[#2c313b] border-[#ff9900] text-[#ff9900]'
+                                  : 'bg-[#1c1f26] border-[#2e333e] text-[#b4bac4] hover:text-white'
+                              }`}
+                            >
+                              {ax.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between gap-3 pt-1">
+                        <div>
+                          <div className="text-xs font-medium text-[#eceef2]">
+                            Caras individuales por defecto
+                          </div>
+                          <div className="text-[11px] text-[#8e95a2]">
+                            Extruye cada cara seleccionada de forma independiente
+                          </div>
+                        </div>
+                        {renderSwitch(
+                          settings.toolConfigs.extrude.defaultIndividual,
+                          () =>
+                            onUpdateToolConfig('extrude', {
+                              defaultIndividual:
+                                !settings.toolConfigs.extrude.defaultIndividual,
+                            }),
+                          'Caras individuales en Extruir',
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {selectedToolId === 'bevel' && (
+                    <div className="space-y-3">
+                      <label className="block space-y-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-medium text-[#eceef2]">
+                            Ancho predeterminado
+                          </span>
+                          <span className="font-mono-tabular text-[#ff9900]">
+                            {settings.toolConfigs.bevel.defaultWidth.toFixed(2)}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.02}
+                          max={1.5}
+                          step={0.02}
+                          value={settings.toolConfigs.bevel.defaultWidth}
+                          onChange={(e) =>
+                            onUpdateToolConfig('bevel', {
+                              defaultWidth: parseFloat(e.target.value),
+                            })
+                          }
+                          className="w-full accent-[#ff9900] cursor-pointer"
+                        />
+                      </label>
+
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs font-medium text-[#eceef2]">
+                          Segmentos
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateToolConfig('bevel', {
+                                defaultSegments: Math.max(
+                                  1,
+                                  settings.toolConfigs.bevel.defaultSegments - 1,
+                                ),
+                              })
+                            }
+                            className="w-9 h-9 rounded-md bg-[#22252e] hover:bg-[#2c313b] border border-[#343947] text-sm font-bold text-[#e4e6eb]"
+                          >
+                            −
+                          </button>
+                          <span className="w-8 text-center text-xs font-mono-tabular font-semibold text-[#f3f4f6]">
+                            {settings.toolConfigs.bevel.defaultSegments}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateToolConfig('bevel', {
+                                defaultSegments: Math.min(
+                                  5,
+                                  settings.toolConfigs.bevel.defaultSegments + 1,
+                                ),
+                              })
+                            }
+                            className="w-9 h-9 rounded-md bg-[#22252e] hover:bg-[#2c313b] border border-[#343947] text-sm font-bold text-[#e4e6eb]"
+                          >
+                            +
+                          </button>
+                        </div>
+                      </div>
+
+                      <label className="block space-y-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-medium text-[#eceef2]">
+                            Perfil predeterminado
+                          </span>
+                          <span className="font-mono-tabular text-[#ff9900]">
+                            {settings.toolConfigs.bevel.defaultProfile.toFixed(2)}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.1}
+                          max={1}
+                          step={0.05}
+                          value={settings.toolConfigs.bevel.defaultProfile}
+                          onChange={(e) =>
+                            onUpdateToolConfig('bevel', {
+                              defaultProfile: parseFloat(e.target.value),
+                            })
+                          }
+                          className="w-full accent-[#ff9900] cursor-pointer"
+                        />
+                      </label>
+
+                      <div className="flex items-center justify-between gap-3 pt-1">
+                        <div>
+                          <div className="text-xs font-medium text-[#eceef2]">
+                            Limitar solapamiento
+                          </div>
+                          <div className="text-[11px] text-[#8e95a2]">
+                            Evita que el bisel cruce caras vecinas
+                          </div>
+                        </div>
+                        {renderSwitch(
+                          settings.toolConfigs.bevel.defaultClampOverlap,
+                          () =>
+                            onUpdateToolConfig('bevel', {
+                              defaultClampOverlap:
+                                !settings.toolConfigs.bevel.defaultClampOverlap,
+                            }),
+                          'Limitar solapamiento en Biselar',
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {selectedToolId === 'subdivide' && (
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs font-medium text-[#eceef2]">
+                          Cortes predeterminados
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateToolConfig('subdivide', {
+                                defaultCuts: Math.max(
+                                  1,
+                                  settings.toolConfigs.subdivide.defaultCuts - 1,
+                                ),
+                              })
+                            }
+                            className="w-9 h-9 rounded-md bg-[#22252e] hover:bg-[#2c313b] border border-[#343947] text-sm font-bold text-[#e4e6eb]"
+                          >
+                            −
+                          </button>
+                          <span className="w-8 text-center text-xs font-mono-tabular font-semibold text-[#f3f4f6]">
+                            {settings.toolConfigs.subdivide.defaultCuts}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateToolConfig('subdivide', {
+                                defaultCuts: Math.min(
+                                  6,
+                                  settings.toolConfigs.subdivide.defaultCuts + 1,
+                                ),
+                              })
+                            }
+                            className="w-9 h-9 rounded-md bg-[#22252e] hover:bg-[#2c313b] border border-[#343947] text-sm font-bold text-[#e4e6eb]"
+                          >
+                            +
+                          </button>
+                        </div>
+                      </div>
+
+                      <label className="block space-y-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-medium text-[#eceef2]">
+                            Suavizado predeterminado
+                          </span>
+                          <span className="font-mono-tabular text-[#ff9900]">
+                            {settings.toolConfigs.subdivide.defaultSmoothness.toFixed(
+                              2,
+                            )}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={settings.toolConfigs.subdivide.defaultSmoothness}
+                          onChange={(e) =>
+                            onUpdateToolConfig('subdivide', {
+                              defaultSmoothness: parseFloat(e.target.value),
+                            })
+                          }
+                          className="w-full accent-[#ff9900] cursor-pointer"
+                        />
+                      </label>
+
+                      <label className="block space-y-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-medium text-[#eceef2]">
+                            Fractal predeterminado
+                          </span>
+                          <span className="font-mono-tabular text-[#ff9900]">
+                            {settings.toolConfigs.subdivide.defaultFractal.toFixed(
+                              2,
+                            )}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={0.5}
+                          step={0.02}
+                          value={settings.toolConfigs.subdivide.defaultFractal}
+                          onChange={(e) =>
+                            onUpdateToolConfig('subdivide', {
+                              defaultFractal: parseFloat(e.target.value),
+                            })
+                          }
+                          className="w-full accent-[#ff9900] cursor-pointer"
+                        />
+                      </label>
+                    </div>
+                  )}
+
+                  {selectedToolId === 'inset' && (
+                    <div className="space-y-3">
+                      <label className="block space-y-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-medium text-[#eceef2]">
+                            Grosor predeterminado
+                          </span>
+                          <span className="font-mono-tabular text-[#ff9900]">
+                            {settings.toolConfigs.inset.defaultThickness.toFixed(
+                              2,
+                            )}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.02}
+                          max={0.9}
+                          step={0.02}
+                          value={settings.toolConfigs.inset.defaultThickness}
+                          onChange={(e) =>
+                            onUpdateToolConfig('inset', {
+                              defaultThickness: parseFloat(e.target.value),
+                            })
+                          }
+                          className="w-full accent-[#ff9900] cursor-pointer"
+                        />
+                      </label>
+
+                      <label className="block space-y-1">
+                        <span className="text-xs font-medium text-[#eceef2]">
+                          Profundidad predeterminada
+                        </span>
+                        <input
+                          type="number"
+                          step="0.05"
+                          value={settings.toolConfigs.inset.defaultDepth}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            if (Number.isFinite(v)) {
+                              onUpdateToolConfig('inset', { defaultDepth: v });
+                            }
+                          }}
+                          className="w-full h-10 px-2.5 rounded-md bg-[#111317] border border-[#2f333d] text-xs font-mono-tabular text-[#f3f4f6] focus:outline-none focus:border-[#ff9900]"
+                        />
+                      </label>
+
+                      <div className="flex items-center justify-between gap-3 pt-1">
+                        <div>
+                          <div className="text-xs font-medium text-[#eceef2]">
+                            Caras individuales por defecto
+                          </div>
+                          <div className="text-[11px] text-[#8e95a2]">
+                            Inserta cada cara por separado en lugar de la región
+                          </div>
+                        </div>
+                        {renderSwitch(
+                          settings.toolConfigs.inset.defaultIndividual,
+                          () =>
+                            onUpdateToolConfig('inset', {
+                              defaultIndividual:
+                                !settings.toolConfigs.inset.defaultIndividual,
+                            }),
+                          'Individual en Insertar',
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {selectedToolId === 'loopCut' && (
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs font-medium text-[#eceef2]">
+                          Cortes predeterminados
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateToolConfig('loopCut', {
+                                defaultCuts: Math.max(
+                                  1,
+                                  settings.toolConfigs.loopCut.defaultCuts - 1,
+                                ),
+                              })
+                            }
+                            className="w-9 h-9 rounded-md bg-[#22252e] hover:bg-[#2c313b] border border-[#343947] text-sm font-bold text-[#e4e6eb]"
+                          >
+                            −
+                          </button>
+                          <span className="w-8 text-center text-xs font-mono-tabular font-semibold text-[#f3f4f6]">
+                            {settings.toolConfigs.loopCut.defaultCuts}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateToolConfig('loopCut', {
+                                defaultCuts: Math.min(
+                                  24,
+                                  settings.toolConfigs.loopCut.defaultCuts + 1,
+                                ),
+                              })
+                            }
+                            className="w-9 h-9 rounded-md bg-[#22252e] hover:bg-[#2c313b] border border-[#343947] text-sm font-bold text-[#e4e6eb]"
+                          >
+                            +
+                          </button>
+                        </div>
+                      </div>
+
+                      <label className="block space-y-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-medium text-[#eceef2]">
+                            Desplazamiento inicial (Slide)
+                          </span>
+                          <span className="font-mono-tabular text-[#38bdf8]">
+                            {settings.toolConfigs.loopCut.defaultSlide.toFixed(
+                              2,
+                            )}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={-1}
+                          max={1}
+                          step={0.05}
+                          value={settings.toolConfigs.loopCut.defaultSlide}
+                          onChange={(e) =>
+                            onUpdateToolConfig('loopCut', {
+                              defaultSlide: parseFloat(e.target.value),
+                            })
+                          }
+                          className="w-full accent-[#38bdf8] cursor-pointer"
+                        />
+                      </label>
+                    </div>
+                  )}
+
+                  {selectedToolId === 'mergeByDistance' && (
+                    <div className="space-y-3">
+                      <label className="block space-y-1">
+                        <span className="text-xs font-medium text-[#eceef2]">
+                          Umbral de distancia predeterminado
+                        </span>
+                        <input
+                          type="number"
+                          min={0.0001}
+                          step={0.001}
+                          value={
+                            settings.toolConfigs.mergeByDistance.defaultDistance
+                          }
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            if (Number.isFinite(v) && v >= 0.0001) {
+                              onUpdateToolConfig('mergeByDistance', {
+                                defaultDistance: v,
+                              });
+                            }
+                          }}
+                          className="w-full h-10 px-2.5 rounded-md bg-[#111317] border border-[#2f333d] text-xs font-mono-tabular text-[#f3f4f6] focus:outline-none focus:border-[#ff9900]"
+                        />
+                        <span className="block text-[10px] text-[#8e95a2]">
+                          Une automáticamente vértices separados por una distancia menor o igual a este valor.
+                        </span>
+                      </label>
+                    </div>
+                  )}
+
+                  {selectedToolId === 'dissolveLimited' && (
+                    <div className="space-y-3">
+                      <label className="block space-y-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-medium text-[#eceef2]">
+                            Ángulo máximo predeterminado
+                          </span>
+                          <span className="font-mono-tabular text-[#38bdf8]">
+                            {settings.toolConfigs.dissolveLimited.defaultMaxAngleDeg.toFixed(
+                              1,
+                            )}
+                            °
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.5}
+                          max={90}
+                          step={0.5}
+                          value={
+                            settings.toolConfigs.dissolveLimited
+                              .defaultMaxAngleDeg
+                          }
+                          onChange={(e) =>
+                            onUpdateToolConfig('dissolveLimited', {
+                              defaultMaxAngleDeg: parseFloat(e.target.value),
+                            })
+                          }
+                          className="w-full accent-[#38bdf8] cursor-pointer"
+                        />
+                      </label>
+
+                      <div className="flex items-center justify-between gap-3 pt-1">
+                        <div>
+                          <div className="text-xs font-medium text-[#eceef2]">
+                            Disolver vértices colineales
+                          </div>
+                          <div className="text-[11px] text-[#8e95a2]">
+                            Limpia vértices sobrantes en bordes rectos
+                          </div>
+                        </div>
+                        {renderSwitch(
+                          settings.toolConfigs.dissolveLimited
+                            .defaultDissolveVertices,
+                          () =>
+                            onUpdateToolConfig('dissolveLimited', {
+                              defaultDissolveVertices:
+                                !settings.toolConfigs.dissolveLimited
+                                  .defaultDissolveVertices,
+                            }),
+                          'Disolver vértices en Limitar disolución',
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {selectedToolId === 'move' && (
+                    <div className="space-y-3">
+                      <div className="space-y-1.5">
+                        <span className="block text-xs font-medium text-[#eceef2]">
+                          Modalidad inicial al seleccionar Mover
+                        </span>
+                        <div className="grid grid-cols-3 gap-1.5">
+                          {(
+                            [
+                              { id: 'free', label: 'Free' },
+                              { id: 'axis', label: 'Axis' },
+                              { id: 'slide', label: 'Slide' },
+                            ] as { id: MoveSubMode; label: string }[]
+                          ).map((m) => (
+                            <button
+                              key={m.id}
+                              type="button"
+                              onClick={() =>
+                                onUpdateToolConfig('move', {
+                                  defaultSubMode: m.id,
+                                })
+                              }
+                              className={`h-9 rounded-md border text-xs font-semibold transition-colors ${
+                                settings.toolConfigs.move.defaultSubMode === m.id
+                                  ? 'bg-[#2c313b] border-[#ff9900] text-[#ff9900]'
+                                  : 'bg-[#1c1f26] border-[#2e333e] text-[#b4bac4] hover:text-white'
+                              }`}
+                            >
+                              {m.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between gap-3 pt-1">
+                        <div>
+                          <div className="text-xs font-medium text-[#eceef2]">
+                            Ajuste incremental (Snap)
+                          </div>
+                          <div className="text-[11px] text-[#8e95a2]">
+                            Activa pasos discretos al arrastrar el gizmo
+                          </div>
+                        </div>
+                        {renderSwitch(
+                          settings.snapEnabled,
+                          () =>
+                            onUpdateSettings({
+                              snapEnabled: !settings.snapEnabled,
+                            }),
+                          'Snap al mover',
+                        )}
+                      </div>
+
+                      <label className="block space-y-1">
+                        <span className="text-xs font-medium text-[#eceef2]">
+                          Paso de desplazamiento (Snap)
+                        </span>
+                        <input
+                          type="number"
+                          min={0.01}
+                          step={0.05}
+                          value={settings.snapTranslateStep}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            if (Number.isFinite(v) && v > 0) {
+                              onUpdateSettings({ snapTranslateStep: v });
+                            }
+                          }}
+                          className="w-full h-10 px-2.5 rounded-md bg-[#111317] border border-[#2f333d] text-xs font-mono-tabular text-[#f3f4f6] focus:outline-none focus:border-[#ff9900]"
+                        />
+                      </label>
+                    </div>
+                  )}
+
+                  {selectedToolId === 'rotate' && (
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-xs font-medium text-[#eceef2]">
+                            Ajuste incremental (Snap)
+                          </div>
+                          <div className="text-[11px] text-[#8e95a2]">
+                            Restringe la rotación del gizmo por ángulos exactos
+                          </div>
+                        </div>
+                        {renderSwitch(
+                          settings.snapEnabled,
+                          () =>
+                            onUpdateSettings({
+                              snapEnabled: !settings.snapEnabled,
+                            }),
+                          'Snap al rotar',
+                        )}
+                      </div>
+
+                      <label className="block space-y-1">
+                        <span className="text-xs font-medium text-[#eceef2]">
+                          Ángulo de paso (°)
+                        </span>
+                        <input
+                          type="number"
+                          min={1}
+                          step={5}
+                          value={settings.snapRotateDeg}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            if (Number.isFinite(v) && v > 0) {
+                              onUpdateSettings({ snapRotateDeg: v });
+                            }
+                          }}
+                          className="w-full h-10 px-2.5 rounded-md bg-[#111317] border border-[#2f333d] text-xs font-mono-tabular text-[#f3f4f6] focus:outline-none focus:border-[#ff9900]"
+                        />
+                      </label>
+                    </div>
+                  )}
+
+                  {selectedToolId === 'scale' && (
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-xs font-medium text-[#eceef2]">
+                            Ajuste incremental (Snap)
+                          </div>
+                          <div className="text-[11px] text-[#8e95a2]">
+                            Escala en múltiplos fijos con el manipulador
+                          </div>
+                        </div>
+                        {renderSwitch(
+                          settings.snapEnabled,
+                          () =>
+                            onUpdateSettings({
+                              snapEnabled: !settings.snapEnabled,
+                            }),
+                          'Snap al escalar',
+                        )}
+                      </div>
+
+                      <label className="block space-y-1">
+                        <span className="text-xs font-medium text-[#eceef2]">
+                          Paso de escala (Snap)
+                        </span>
+                        <input
+                          type="number"
+                          min={0.01}
+                          step={0.05}
+                          value={settings.snapScaleStep}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            if (Number.isFinite(v) && v > 0) {
+                              onUpdateSettings({ snapScaleStep: v });
+                            }
+                          }}
+                          className="w-full h-10 px-2.5 rounded-md bg-[#111317] border border-[#2f333d] text-xs font-mono-tabular text-[#f3f4f6] focus:outline-none focus:border-[#ff9900]"
+                        />
+                      </label>
+                    </div>
+                  )}
+
+                  {selectedToolId === 'proportional' && (
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-xs font-medium text-[#eceef2]">
+                            Edición proporcional activa
+                          </div>
+                          <div className="text-[11px] text-[#8e95a2]">
+                            Deforma suavemente los vértices cercanos al arrastrar
+                          </div>
+                        </div>
+                        {renderSwitch(
+                          settings.proportionalEditing.enabled,
+                          () =>
+                            onUpdateProportionalSettings({
+                              enabled: !settings.proportionalEditing.enabled,
+                            }),
+                          'Edición proporcional activa',
+                        )}
+                      </div>
+
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-xs font-medium text-[#eceef2]">
+                            Solo vértices conectados
+                          </div>
+                          <div className="text-[11px] text-[#8e95a2]">
+                            Usa distancia topológica sobre aristas conectadas
+                          </div>
+                        </div>
+                        {renderSwitch(
+                          settings.proportionalEditing.connectedOnly,
+                          () =>
+                            onUpdateProportionalSettings({
+                              connectedOnly:
+                                !settings.proportionalEditing.connectedOnly,
+                            }),
+                          'Solo conectados',
+                        )}
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <span className="block text-xs font-medium text-[#eceef2]">
+                          Curva de caída
+                        </span>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {PROPORTIONAL_FALLOFF_LIST.map((item) => (
+                            <button
+                              key={item.id}
+                              type="button"
+                              onClick={() =>
+                                onUpdateProportionalSettings({
+                                  falloff: item.id,
+                                })
+                              }
+                              className={`h-9 px-2 rounded-md border text-xs font-semibold text-left transition-colors ${
+                                settings.proportionalEditing.falloff === item.id
+                                  ? 'bg-[#2c313b] border-[#ff9900] text-[#ff9900]'
+                                  : 'bg-[#1c1f26] border-[#2e333e] text-[#b4bac4] hover:text-white'
+                              }`}
+                            >
+                              {item.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <label className="block space-y-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-medium text-[#eceef2]">
+                            Radio de influencia
+                          </span>
+                          <span className="font-mono-tabular text-[#ff9900]">
+                            {settings.proportionalEditing.radius.toFixed(2)}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.05}
+                          max={6}
+                          step={0.05}
+                          value={Math.min(
+                            6,
+                            settings.proportionalEditing.radius,
+                          )}
+                          onChange={(e) =>
+                            onUpdateProportionalSettings({
+                              radius: clampProportionalRadius(
+                                parseFloat(e.target.value),
+                              ),
+                            })
+                          }
+                          className="w-full accent-[#ff9900] cursor-pointer"
+                        />
+                      </label>
+                    </div>
+                  )}
+                </div>
+
+                {/* Per-tool & Global Reset Actions */}
+                <div className="pt-3 border-t border-[#262a33] flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    data-testid="reset-single-tool-config"
+                    onClick={() => onResetToolConfig(selectedToolId)}
+                    className="h-9 px-3 rounded-md bg-[#22252e] hover:bg-[#2c313b] border border-[#353a46] text-xs font-semibold text-[#e5e7eb] flex items-center gap-1.5 transition-colors"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5 text-[#ff9900]" />
+                    <span>Restaurar herramienta</span>
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="reset-all-tools-config"
+                    onClick={onResetAllToolConfigs}
+                    className="h-9 px-3 rounded-md bg-[#271b1e] hover:bg-[#362227] border border-[#4d2d33] text-xs font-semibold text-[#fca5a5] flex items-center gap-1.5 transition-colors"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Restaurar todas</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : activeTab === 'viewer' ? (
             <>
               {(
                 [
@@ -578,10 +1553,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <div className="flex items-center justify-between gap-3">
                       <div className="min-w-0">
                         <div className="text-xs font-medium text-[#eceef2]">
-                          Panel flotante de modificadores en el visor
+                          Botones de modificadores en barra lateral
                         </div>
                         <div className="text-[11px] text-[#8e95a2] leading-tight">
-                          Muestra botones táctiles movibles para SHIFT, CTRL y ALT con soporte simultáneo.
+                          Habilita SHIFT, CTRL y ALT en la sección Modificadores con soporte simultáneo.
                         </div>
                       </div>
                       {renderSwitch(
@@ -591,7 +1566,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             modifierPanelEnabled:
                               !settings.touch.modifierPanelEnabled,
                           }),
-                        'Panel flotante de modificadores',
+                        'Modificadores en barra lateral',
                       )}
                     </div>
 
@@ -692,7 +1667,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             )}
                             <div className="flex items-center justify-between gap-2">
                               <span className="text-[11px] text-[#cbd5e1]">
-                                Botón {mod.badgeText} visible en el panel flotante
+                                Botón {mod.badgeText} visible en la barra lateral
                               </span>
                               {renderSwitch(
                                 cfg.showScreenButton,

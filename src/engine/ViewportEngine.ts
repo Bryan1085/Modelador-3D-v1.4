@@ -281,7 +281,10 @@ export class ViewportEngine {
   private projection: CameraProjection = 'perspective';
 
   private orbitControls: OrbitControls;
+  private scaleGizmoControls: TransformControls;
+  private rotateGizmoControls: TransformControls;
   private transformControls: TransformControls;
+  private activeDraggingGizmo: TransformControls | null = null;
   private editGizmoAnchor: THREE.Object3D;
 
   private gridHelper: THREE.GridHelper;
@@ -350,8 +353,12 @@ export class ViewportEngine {
   private trackballStartQuat = new THREE.Quaternion();
   private trackballDeltaQuat = new THREE.Quaternion();
   private modalTransformMode: ModalGMode | null = null;
+  private modalTransformCommitOnRelease = true;
   private modalSlideClamp = true;
   private modalCancelNonce = 0;
+  private slideSessionBaseMesh: EditableMesh | null = null;
+  private slideSessionHasChanges = false;
+  private cameraRotationLocked = false;
   private isModalDragging = false;
   private modalMoved = false;
   private modalStartX = 0;
@@ -672,56 +679,95 @@ export class ViewportEngine {
     this.editGizmoAnchor = new THREE.Object3D();
     this.scene.add(this.editGizmoAnchor);
 
-    // 1. TransformControls Gizmo (handles gizmo pointerdown before gesture & orbit)
-    this.transformControls = new TransformControls(
-      this.activeCamera,
-      this.renderer.domElement,
-    );
-    this.transformControls.setSize(1.25);
-    this.transformControls.setColors(0xe05252, 0x52b852, 0x48bce8, 0xffff00);
-    this.transformControls.getRaycaster().params.Line.threshold = 0.25;
-    this.scene.add(this.transformControls.getHelper());
+    // 1. TransformControls Gizmos (bound BEFORE gesture & orbit; ordered inner Scale -> middle Rotate -> outer Translate for conflict-free ALL mode)
+    const createConfiguredGizmo = (): TransformControls => {
+      const ctrl = new TransformControls(
+        this.activeCamera,
+        this.renderer.domElement,
+      );
+      ctrl.setSize(1.25);
+      ctrl.setColors(0xe05252, 0x52b852, 0x48bce8, 0xffff00);
+      ctrl.getRaycaster().params.Line.threshold = 0.25;
+      this.scene.add(ctrl.getHelper());
+      return ctrl;
+    };
 
-    this.transformControls.addEventListener('dragging-changed', (event) => {
-      const dragging = Boolean(event.value);
-      this.isGizmoDragging = dragging;
-      if (dragging) {
-        if (this.isTrackballDragging) {
-          this.cancelTrackballRotate();
+    this.scaleGizmoControls = createConfiguredGizmo();
+    this.scaleGizmoControls.setMode('scale');
+    this.scaleGizmoControls.enabled = false;
+
+    this.rotateGizmoControls = createConfiguredGizmo();
+    this.rotateGizmoControls.setMode('rotate');
+    this.rotateGizmoControls.enabled = false;
+
+    this.transformControls = createConfiguredGizmo();
+
+    const bindGizmoListeners = (ctrl: TransformControls) => {
+      ctrl.addEventListener('dragging-changed', (event) => {
+        const dragging = Boolean(event.value);
+        if (dragging) {
+          this.activeDraggingGizmo = ctrl;
+          for (const other of [
+            this.scaleGizmoControls,
+            this.rotateGizmoControls,
+            this.transformControls,
+          ]) {
+            if (other !== ctrl) {
+              other.enabled = false;
+            }
+          }
+          if (this.isTrackballDragging) {
+            this.cancelTrackballRotate();
+          }
+          if (this.isModalDragging) {
+            this.cancelModalTransform();
+          }
+          this.gestureManager.invalidateCurrentGesture();
+        } else {
+          this.activeDraggingGizmo = null;
+          this.syncGizmoEnabledState();
         }
-        if (this.isModalDragging) {
-          this.cancelModalTransform();
+        this.isGizmoDragging = dragging;
+        this.orbitControls.enabled =
+          !dragging &&
+          !this.isTrackballDragging &&
+          !this.isModalDragging &&
+          !this.suppressOrbitForContextPress &&
+          !this.isBoxSelectBlocking;
+        if (dragging) {
+          this.handleGizmoDragStart();
+        } else {
+          this.handleGizmoDragEnd();
         }
-        this.gestureManager.invalidateCurrentGesture();
-      }
-      this.orbitControls.enabled =
-        !dragging &&
-        !this.isTrackballDragging &&
-        !this.isModalDragging &&
-        !this.suppressOrbitForContextPress &&
-        !this.isBoxSelectBlocking;
-      if (dragging) {
-        this.handleGizmoDragStart();
-      } else {
-        this.handleGizmoDragEnd();
-      }
-      this.requestRender();
-    });
+        this.requestRender();
+      });
 
-    this.transformControls.addEventListener('objectChange', () => {
-      this.handleGizmoObjectChange();
-      this.requestRender();
-    });
+      ctrl.addEventListener('objectChange', () => {
+        if (this.activeDraggingGizmo && this.activeDraggingGizmo !== ctrl) {
+          return;
+        }
+        this.handleGizmoObjectChange();
+        this.requestRender();
+      });
 
-    this.transformControls.addEventListener('change', () => {
-      this.requestRender();
-    });
+      ctrl.addEventListener('change', () => {
+        this.requestRender();
+      });
+    };
+
+    bindGizmoListeners(this.scaleGizmoControls);
+    bindGizmoListeners(this.rotateGizmoControls);
+    bindGizmoListeners(this.transformControls);
 
     // 2. Centralized Multi-Touch Pointer Gesture Manager (must bind BEFORE OrbitControls so Double-Tap Box Select locks orbit on pointerdown)
     const dom = this.renderer.domElement;
     this.gestureManager = new TouchGestureManager(dom, DEFAULT_TOUCH_SETTINGS, {
       isGizmoBusy: () =>
-        this.isGizmoDragging || this.transformControls.axis !== null,
+        this.isGizmoDragging ||
+        this.transformControls.axis !== null ||
+        (this.activeTool === 'all' &&
+          (this.rotateGizmoControls.axis !== null ||
+            this.scaleGizmoControls.axis !== null)),
       isBoxSelectDisabled: () => this.loopCutPreviewMode,
       isShiftHoldDisabled: () =>
         this.loopCutPreviewMode && this.loopCutSlideActive,
@@ -994,9 +1040,9 @@ export class ViewportEngine {
       this.suppressOrbitForContextPress = false;
       this.loopCutSlidePointerId = null;
       this.orbitControls.enabled = !this.isAnyTransformDragging();
-      this.orbitControls.enableRotate = !(
-        this.loopCutPreviewMode && this.loopCutSlideActive
-      );
+      this.orbitControls.enableRotate =
+        !this.cameraRotationLocked &&
+        !(this.loopCutPreviewMode && this.loopCutSlideActive);
       this.orbitControls.enableZoom = true;
       this.orbitControls.enablePan = true;
       return;
@@ -1022,15 +1068,21 @@ export class ViewportEngine {
     );
     if (!hasTouch) {
       this.orbitControls.enabled = !this.isAnyTransformDragging();
-      this.orbitControls.enableRotate = !slideBlockingOrbit;
+      this.orbitControls.enableRotate =
+        !this.cameraRotationLocked && !slideBlockingOrbit;
       this.orbitControls.enableZoom = true;
       this.orbitControls.enablePan = true;
       return;
     }
 
-    this.orbitControls.enableRotate = !slideBlockingOrbit && touchCfg.oneFingerOrbit;
+    this.orbitControls.enableRotate =
+      !this.cameraRotationLocked && !slideBlockingOrbit && touchCfg.oneFingerOrbit;
     this.orbitControls.enableZoom = touchCfg.twoFingerPinchZoom;
     this.orbitControls.enablePan = touchCfg.twoFingerPan;
+    this.orbitControls.touches = {
+      ONE: this.cameraRotationLocked ? THREE.TOUCH.PAN : THREE.TOUCH.ROTATE,
+      TWO: THREE.TOUCH.DOLLY_PAN,
+    };
     this.orbitControls.enabled = !this.isAnyTransformDragging();
   }
 
@@ -2384,6 +2436,15 @@ export class ViewportEngine {
       this.modalStartObjPos.copy(g.position);
       this.editDragStartAnchorPos.copy(g.position);
     } else {
+      if (
+        !this.modalTransformCommitOnRelease &&
+        (this.modalTransformMode === 'vertex_slide' ||
+          this.modalTransformMode === 'edge_slide') &&
+        !this.slideSessionBaseMesh
+      ) {
+        this.slideSessionBaseMesh = visual.baseEditableMesh.clone();
+        this.slideSessionHasChanges = false;
+      }
       this.editDragStartMesh = visual.baseEditableMesh.clone();
       this.editDragStartVertexIds = visual.baseEditableMesh.getVertexIdsFromSelection(
         this.editSelectionMode,
@@ -2787,6 +2848,35 @@ export class ViewportEngine {
         committed = true;
       }
     } else if (this.workMode === 'edit' && this.editDragStartMesh) {
+      if (
+        !this.modalTransformCommitOnRelease &&
+        (this.modalTransformMode === 'vertex_slide' ||
+          this.modalTransformMode === 'edge_slide')
+      ) {
+        this.editDragStartMesh = null;
+        this.editDragStartVertexPositions.clear();
+        this.proportionalDragField = null;
+        this.proportionalDragWeights.clear();
+        this.proportionalPreviewField = null;
+        if (wasMoved) {
+          this.slideSessionHasChanges = true;
+        }
+        this.callbacks.onModalTransformStatusChange?.({
+          active: false,
+          mode: this.modalTransformMode,
+          label:
+            this.modalTransformMode === 'vertex_slide'
+              ? 'Vertex Slide'
+              : 'Edge Slide',
+          deltaText: this.slideSessionHasChanges
+            ? 'Previsualización lista'
+            : 'Arrastra sobre la malla',
+        });
+        this.syncGizmoAttachment();
+        this.requestRender();
+        return;
+      }
+
       const before = this.editDragStartMesh;
       this.editDragStartMesh = null;
       this.editDragStartVertexPositions.clear();
@@ -2805,8 +2895,46 @@ export class ViewportEngine {
     this.requestRender();
   }
 
+  public confirmModalSlidePreview(): boolean {
+    if (this.isModalDragging) {
+      this.endModalTransform();
+    }
+    const objId = this.selectedObjectId;
+    const visual = objId ? this.visuals.get(objId) : undefined;
+    if (
+      this.workMode === 'edit' &&
+      objId &&
+      visual &&
+      this.slideSessionBaseMesh &&
+      this.slideSessionHasChanges
+    ) {
+      const before = this.slideSessionBaseMesh;
+      const after = visual.baseEditableMesh.clone();
+      this.slideSessionBaseMesh = null;
+      this.slideSessionHasChanges = false;
+      this.callbacks.onModalTransformStatusChange?.(null);
+      this.callbacks.onCommitMeshEdit(objId, before, after);
+      this.callbacks.onCompleteModalTransform?.(true);
+      this.syncGizmoAttachment();
+      this.requestRender();
+      return true;
+    }
+    this.slideSessionBaseMesh = null;
+    this.slideSessionHasChanges = false;
+    this.callbacks.onModalTransformStatusChange?.(null);
+    this.callbacks.onCompleteModalTransform?.(true);
+    this.syncGizmoAttachment();
+    this.requestRender();
+    return false;
+  }
+
   private cancelModalTransform(): void {
-    if (!this.isModalDragging && !this.objectDragStartTransform && !this.editDragStartMesh) {
+    if (
+      !this.isModalDragging &&
+      !this.objectDragStartTransform &&
+      !this.editDragStartMesh &&
+      !this.slideSessionBaseMesh
+    ) {
       this.callbacks.onModalTransformStatusChange?.(null);
       return;
     }
@@ -2830,8 +2958,13 @@ export class ViewportEngine {
         visual.group.scale.set(...before.scale);
         this.syncLiveObjectTransformAndMirrors(this.selectedObjectId, before);
       }
-    } else if (this.workMode === 'edit' && this.editDragStartMesh) {
-      const before = this.editDragStartMesh;
+    } else if (
+      this.workMode === 'edit' &&
+      (this.slideSessionBaseMesh || this.editDragStartMesh)
+    ) {
+      const before = (this.slideSessionBaseMesh ?? this.editDragStartMesh)!;
+      this.slideSessionBaseMesh = null;
+      this.slideSessionHasChanges = false;
       this.editDragStartMesh = null;
       this.editDragStartVertexPositions.clear();
       this.proportionalDragField = null;
@@ -2840,6 +2973,9 @@ export class ViewportEngine {
       if (visual) {
         this.commitEditedMeshToVisual(visual, before, new Set());
       }
+    } else {
+      this.slideSessionBaseMesh = null;
+      this.slideSessionHasChanges = false;
     }
 
     this.syncGizmoAttachment();
@@ -2894,8 +3030,10 @@ export class ViewportEngine {
     loopCutSlideActive?: boolean;
     mergeCursorPosition?: Vec3 | null;
     modalTransformMode?: ModalGMode | null;
+    modalTransformCommitOnRelease?: boolean;
     modalSlideClamp?: boolean;
     modalCancelNonce?: number;
+    cameraRotationLocked?: boolean;
   }): void {
     if (
       params.modalCancelNonce !== undefined &&
@@ -2905,7 +3043,14 @@ export class ViewportEngine {
       this.cancelModalTransform();
     }
     this.modalTransformMode = params.modalTransformMode ?? null;
+    this.modalTransformCommitOnRelease =
+      params.modalTransformCommitOnRelease ?? true;
     this.modalSlideClamp = params.modalSlideClamp ?? true;
+    if (!this.modalTransformMode) {
+      this.slideSessionBaseMesh = null;
+      this.slideSessionHasChanges = false;
+    }
+    this.cameraRotationLocked = Boolean(params.cameraRotationLocked);
 
     this.virtualModifiers = params.virtualModifiers
       ? { ...params.virtualModifiers }
@@ -2960,10 +3105,14 @@ export class ViewportEngine {
     this.loopCutSlideActive = Boolean(params.loopCutSlideActive);
     if (!this.loopCutPreviewMode || !this.loopCutSlideActive) {
       this.loopCutSlidePointerId = null;
-      this.orbitControls.enableRotate = true;
-    } else {
-      this.orbitControls.enableRotate = false;
     }
+    this.orbitControls.enableRotate =
+      !this.cameraRotationLocked &&
+      !(this.loopCutPreviewMode && this.loopCutSlideActive);
+    this.orbitControls.touches = {
+      ONE: this.cameraRotationLocked ? THREE.TOUCH.PAN : THREE.TOUCH.ROTATE,
+      TWO: THREE.TOUCH.DOLLY_PAN,
+    };
     if (params.mergeCursorPosition && params.workMode === 'edit') {
       this.mergeCursorMarker.position.set(...params.mergeCursorPosition);
       this.mergeCursorMarker.visible = true;
@@ -3009,7 +3158,14 @@ export class ViewportEngine {
       if (objData.objectType === 'reference_image' && objData.referenceImage) {
         this.syncReferenceVisual(visual, objData, isSelected);
       } else {
-        if (!(this.isAnyTransformDragging() && this.workMode === 'edit' && this.selectedObjectId === objData.id)) {
+        if (
+          !(
+            (this.isAnyTransformDragging() ||
+              this.slideSessionBaseMesh !== null) &&
+            this.workMode === 'edit' &&
+            this.selectedObjectId === objData.id
+          )
+        ) {
           const modSig = this.buildModifiersSignature(objData, this.sceneTransformRefs);
           if (
             visual.lastMeshData !== objData.mesh ||
@@ -3969,13 +4125,18 @@ export class ViewportEngine {
       this.loopCutPreviewPoints.visible = false;
     }
 
-    // 6. Slide Rail Visual Guides (for Vertex Slide / Edge Slide via G hold)
+    // 6. Slide Rail Visual Guides (for Vertex Slide / Edge Slide via G hold or Move->Slide)
     if (
       !this.loopCutPreviewMode &&
       (this.modalTransformMode === 'vertex_slide' ||
         this.modalTransformMode === 'edge_slide')
     ) {
-      const refMesh = this.editDragStartMesh ?? mesh;
+      const refMesh =
+        (!this.modalTransformCommitOnRelease
+          ? this.slideSessionBaseMesh
+          : null) ??
+        this.editDragStartMesh ??
+        mesh;
       let guideSegments: [Vec3, Vec3][] = [];
       if (this.modalTransformMode === 'vertex_slide') {
         const vIds = refMesh.getVertexIdsFromSelection(
@@ -4057,53 +4218,120 @@ export class ViewportEngine {
     this.proportionalRingVisible = true;
   }
 
+  private syncGizmoEnabledState(): void {
+    if (this.activeDraggingGizmo) {
+      this.transformControls.enabled =
+        this.activeDraggingGizmo === this.transformControls;
+      this.rotateGizmoControls.enabled =
+        this.activeDraggingGizmo === this.rotateGizmoControls;
+      this.scaleGizmoControls.enabled =
+        this.activeDraggingGizmo === this.scaleGizmoControls;
+      return;
+    }
+
+    const canShow =
+      !this.suppressGizmo &&
+      this.activeTool !== 'select' &&
+      Boolean(this.selectedObjectId);
+    this.transformControls.enabled = canShow;
+    const isAll = canShow && this.activeTool === 'all';
+    this.rotateGizmoControls.enabled = isAll;
+    this.scaleGizmoControls.enabled = isAll;
+  }
+
   private syncGizmoSettings(): void {
     const modeMap: Record<TransformTool, 'translate' | 'rotate' | 'scale'> = {
       select: 'translate',
       move: 'translate',
       rotate: 'rotate',
       scale: 'scale',
+      all: 'translate',
     };
-    this.transformControls.setMode(modeMap[this.activeTool]);
-    this.transformControls.setSize(this.settings?.gizmoSize ?? 1.25);
-
+    const baseSize = this.settings?.gizmoSize ?? 1.25;
     const c = this.axisConstraint;
+    const isAll = this.activeTool === 'all';
+
+    this.transformControls.setMode(modeMap[this.activeTool]);
+    this.transformControls.setSize(isAll ? baseSize * 1.38 : baseSize);
     this.transformControls.showX = c === 'free' || c === 'x';
     this.transformControls.showY = c === 'free' || c === 'y';
     this.transformControls.showZ = c === 'free' || c === 'z';
-    this.transformControls.showXY = c === 'free';
-    this.transformControls.showYZ = c === 'free';
-    this.transformControls.showXZ = c === 'free';
-    this.transformControls.showE = c === 'free';
-    this.transformControls.showXYZE = c === 'free';
+    this.transformControls.showXY = !isAll && c === 'free';
+    this.transformControls.showYZ = !isAll && c === 'free';
+    this.transformControls.showXZ = !isAll && c === 'free';
+    this.transformControls.showE = !isAll && c === 'free';
+    this.transformControls.showXYZE = !isAll && c === 'free';
 
-    if (this.settings?.snapEnabled) {
-      this.transformControls.setTranslationSnap(this.settings.snapTranslateStep);
-      this.transformControls.setRotationSnap(
-        THREE.MathUtils.degToRad(this.settings.snapRotateDeg),
-      );
-      this.transformControls.setScaleSnap(this.settings.snapScaleStep);
-    } else {
-      this.transformControls.setTranslationSnap(null);
-      this.transformControls.setRotationSnap(null);
-      this.transformControls.setScaleSnap(null);
+    this.rotateGizmoControls.setMode('rotate');
+    this.rotateGizmoControls.setSize(baseSize * 0.92);
+    this.rotateGizmoControls.showX = c === 'free' || c === 'x';
+    this.rotateGizmoControls.showY = c === 'free' || c === 'y';
+    this.rotateGizmoControls.showZ = c === 'free' || c === 'z';
+    this.rotateGizmoControls.showE = false;
+    this.rotateGizmoControls.showXYZE = false;
+
+    this.scaleGizmoControls.setMode('scale');
+    this.scaleGizmoControls.setSize(baseSize * 0.54);
+    this.scaleGizmoControls.showX = c === 'free' || c === 'x';
+    this.scaleGizmoControls.showY = c === 'free' || c === 'y';
+    this.scaleGizmoControls.showZ = c === 'free' || c === 'z';
+    this.scaleGizmoControls.showXY = false;
+    this.scaleGizmoControls.showYZ = false;
+    this.scaleGizmoControls.showXZ = false;
+
+    for (const ctrl of [
+      this.transformControls,
+      this.rotateGizmoControls,
+      this.scaleGizmoControls,
+    ]) {
+      if (this.settings?.snapEnabled) {
+        ctrl.setTranslationSnap(this.settings.snapTranslateStep);
+        ctrl.setRotationSnap(
+          THREE.MathUtils.degToRad(this.settings.snapRotateDeg),
+        );
+        ctrl.setScaleSnap(this.settings.snapScaleStep);
+      } else {
+        ctrl.setTranslationSnap(null);
+        ctrl.setRotationSnap(null);
+        ctrl.setScaleSnap(null);
+      }
     }
+    this.syncGizmoEnabledState();
+  }
+
+  private detachAllGizmos(): void {
+    this.transformControls.detach();
+    this.rotateGizmoControls.detach();
+    this.scaleGizmoControls.detach();
+    this.syncGizmoEnabledState();
+  }
+
+  private attachGizmoTarget(target: THREE.Object3D): void {
+    this.transformControls.attach(target);
+    if (this.activeTool === 'all') {
+      this.rotateGizmoControls.attach(target);
+      this.scaleGizmoControls.attach(target);
+    } else {
+      this.rotateGizmoControls.detach();
+      this.scaleGizmoControls.detach();
+    }
+    this.syncGizmoEnabledState();
   }
 
   private syncGizmoAttachment(): void {
     if (this.suppressGizmo || this.activeTool === 'select' || !this.selectedObjectId) {
-      this.transformControls.detach();
+      this.detachAllGizmos();
       return;
     }
 
     const visual = this.visuals.get(this.selectedObjectId);
     if (!visual || !visual.group.visible || visual.locked) {
-      this.transformControls.detach();
+      this.detachAllGizmos();
       return;
     }
 
     if (this.workMode === 'object') {
-      this.transformControls.attach(visual.group);
+      this.attachGizmoTarget(visual.group);
       return;
     }
 
@@ -4113,13 +4341,13 @@ export class ViewportEngine {
       this.selectedComponentIds,
     );
     if (vertIds.size === 0) {
-      this.transformControls.detach();
+      this.detachAllGizmos();
       return;
     }
 
     const centroidLocal = visual.baseEditableMesh.computeCentroid(vertIds);
     if (!centroidLocal) {
-      this.transformControls.detach();
+      this.detachAllGizmos();
       return;
     }
 
@@ -4133,7 +4361,7 @@ export class ViewportEngine {
     this.editGizmoAnchor.scale.set(1, 1, 1);
     this.editGizmoAnchor.updateMatrixWorld(true);
 
-    this.transformControls.attach(this.editGizmoAnchor);
+    this.attachGizmoTarget(this.editGizmoAnchor);
   }
 
   public switchProjection(next: CameraProjection): void {
@@ -4164,6 +4392,8 @@ export class ViewportEngine {
     this.projection = next;
     this.orbitControls.object = this.activeCamera;
     this.transformControls.camera = this.activeCamera;
+    this.rotateGizmoControls.camera = this.activeCamera;
+    this.scaleGizmoControls.camera = this.activeCamera;
     this.orbitControls.update();
     this.emitCameraPose();
     this.requestRender();
@@ -4357,6 +4587,8 @@ export class ViewportEngine {
     dom.removeEventListener('pointercancel', this.onLoopCutSlidePointerUp);
 
     this.transformControls.dispose();
+    this.rotateGizmoControls.dispose();
+    this.scaleGizmoControls.dispose();
     this.orbitControls.dispose();
     this.vertexDotTexture.dispose();
     this.loopCutPreviewPoints.geometry.dispose();

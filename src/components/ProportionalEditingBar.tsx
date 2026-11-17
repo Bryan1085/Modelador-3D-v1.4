@@ -18,6 +18,7 @@ interface ProportionalEditingBarProps {
   config: ProportionalEditingSettings;
   hasSelection: boolean;
   modifierWarning?: string | null;
+  embedded?: boolean;
   onToggleEnabled: () => void;
   onToggleConnectedOnly: () => void;
   onChangeFalloff: (falloff: ProportionalFalloff) => void;
@@ -66,6 +67,8 @@ const FalloffCurveSvg: React.FC<{
   );
 };
 
+export const FalloffCurveIcon = FalloffCurveSvg;
+
 export const ProportionalIcon: React.FC<{ className?: string }> = ({
   className = 'w-4 h-4',
 }) => (
@@ -89,6 +92,7 @@ export const ProportionalEditingBar: React.FC<ProportionalEditingBarProps> = ({
   config,
   hasSelection,
   modifierWarning = null,
+  embedded = false,
   onToggleEnabled,
   onToggleConnectedOnly,
   onChangeFalloff,
@@ -144,9 +148,13 @@ export const ProportionalEditingBar: React.FC<ProportionalEditingBarProps> = ({
     <div
       onPointerDown={(e) => e.stopPropagation()}
       onWheel={(e) => e.stopPropagation()}
-      className="absolute top-3 left-1/2 -translate-x-1/2 z-15 flex flex-col items-center gap-1.5 max-w-[calc(100%-140px)] pointer-events-none"
+      className={
+        embedded
+          ? 'relative flex flex-col items-center gap-1.5 pointer-events-none'
+          : 'absolute top-3 left-1/2 -translate-x-1/2 z-15 flex flex-col items-center gap-1.5 max-w-[calc(100%-140px)] pointer-events-none'
+      }
     >
-      <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-1.5 px-2 py-1.5 rounded-xl bg-[#181a1f]/95 border border-[#343a47] shadow-xl backdrop-blur-sm">
+      <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-1.5 px-2 py-1.5 rounded-xl bg-[#181a1f]/95 border border-[#343a47] shadow-xl">
         {/* Toggle ON/OFF */}
         <button
           type="button"

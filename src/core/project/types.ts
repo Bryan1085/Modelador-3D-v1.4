@@ -12,9 +12,27 @@ export type {
 } from '../mesh/proportionalEditing';
 
 export type WorkMode = 'object' | 'edit';
-export type TransformTool = 'select' | 'move' | 'rotate' | 'scale';
+export type TransformTool = 'select' | 'move' | 'rotate' | 'scale' | 'all';
+export type GizmoTransformMode = 'move' | 'rotate' | 'scale' | 'all';
+export type MoveSubMode = 'free' | 'axis' | 'slide';
 export type AxisConstraint = 'free' | 'x' | 'y' | 'z';
 export type CameraProjection = 'perspective' | 'orthographic';
+export type OrthoViewId =
+  | 'front'
+  | 'back'
+  | 'right'
+  | 'left'
+  | 'top'
+  | 'bottom';
+
+export const ORTHO_VIEW_LABELS: Record<OrthoViewId, string> = {
+  front: 'Frontal',
+  back: 'Trasera',
+  right: 'Derecha',
+  left: 'Izquierda',
+  top: 'Superior',
+  bottom: 'Inferior',
+};
 
 export interface ObjectTransform {
   position: Vec3;
@@ -157,6 +175,48 @@ export interface TouchControlSettings {
 
 export type ViewportDisplayMode = 'wireframe' | 'solid' | 'xray' | 'material';
 
+export type ExtrudeDefaultAxis = 'normal' | 'x' | 'y' | 'z';
+
+export interface ToolConfigurations {
+  extrude: {
+    defaultDistance: number;
+    defaultAxis: ExtrudeDefaultAxis;
+    defaultIndividual: boolean;
+  };
+  bevel: {
+    defaultWidth: number;
+    defaultSegments: number;
+    defaultProfile: number;
+    defaultClampOverlap: boolean;
+  };
+  subdivide: {
+    defaultCuts: number;
+    defaultSmoothness: number;
+    defaultFractal: number;
+  };
+  inset: {
+    defaultThickness: number;
+    defaultDepth: number;
+    defaultIndividual: boolean;
+  };
+  loopCut: {
+    defaultCuts: number;
+    defaultSlide: number;
+  };
+  mergeByDistance: {
+    defaultDistance: number;
+  };
+  dissolveLimited: {
+    defaultMaxAngleDeg: number;
+    defaultDissolveVertices: boolean;
+  };
+  move: {
+    defaultSubMode: MoveSubMode;
+  };
+}
+
+export type ConfigurableToolKey = keyof ToolConfigurations;
+
 export interface ModelerSettings {
   displayMode: ViewportDisplayMode;
   xrayTransparency: number;
@@ -172,4 +232,5 @@ export interface ModelerSettings {
   multiSelectTouch: boolean;
   proportionalEditing: ProportionalEditingSettings;
   touch: TouchControlSettings;
+  toolConfigs: ToolConfigurations;
 }

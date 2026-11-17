@@ -14,10 +14,14 @@ import {
   normalizeProportionalSettings,
 } from '../mesh/proportionalEditing';
 import {
+  ExtrudeDefaultAxis,
+  GizmoTransformMode,
   ModelerSettings,
+  MoveSubMode,
   ProjectData,
   ProjectSummary,
   SceneObjectData,
+  ToolConfigurations,
   TouchControlSettings,
   TouchModifierSettings,
   ViewportDisplayMode,
@@ -27,6 +31,50 @@ const INDEX_KEY = 'forma3d_projects_index_v1';
 const PROJECT_PREFIX = 'forma3d_project_v1_';
 const ACTIVE_PROJECT_KEY = 'forma3d_active_project_v1';
 const SETTINGS_KEY = 'forma3d_settings_v1';
+const LAST_GIZMO_MODE_KEY = 'forma3d_last_gizmo_mode_v1';
+const LEFT_TOOLBAR_COLLAPSED_KEY = 'forma3d_left_toolbar_collapsed_v1';
+
+export function loadLastGizmoMode(): GizmoTransformMode {
+  try {
+    const raw = localStorage.getItem(LAST_GIZMO_MODE_KEY);
+    if (raw === 'move' || raw === 'rotate' || raw === 'scale' || raw === 'all') {
+      return raw;
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return 'move';
+}
+
+export function saveLastGizmoMode(mode: GizmoTransformMode): void {
+  try {
+    localStorage.setItem(LAST_GIZMO_MODE_KEY, mode);
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function loadLeftToolbarCollapsed(): boolean {
+  try {
+    const raw = localStorage.getItem(LEFT_TOOLBAR_COLLAPSED_KEY);
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+  } catch {
+    // Ignore storage errors
+  }
+  if (typeof window !== 'undefined') {
+    return window.innerWidth < 720;
+  }
+  return false;
+}
+
+export function saveLeftToolbarCollapsed(collapsed: boolean): void {
+  try {
+    localStorage.setItem(LEFT_TOOLBAR_COLLAPSED_KEY, String(collapsed));
+  } catch {
+    // Ignore storage errors
+  }
+}
 
 export const DEFAULT_TOUCH_MODIFIERS: TouchModifierSettings = {
   shift: {
@@ -75,6 +123,142 @@ export function createDefaultTouchSettings(): TouchControlSettings {
 export const DEFAULT_TOUCH_SETTINGS: TouchControlSettings =
   createDefaultTouchSettings();
 
+export function createDefaultToolConfigs(): ToolConfigurations {
+  return {
+    extrude: {
+      defaultDistance: 0.01,
+      defaultAxis: 'normal',
+      defaultIndividual: false,
+    },
+    bevel: {
+      defaultWidth: 0.2,
+      defaultSegments: 1,
+      defaultProfile: 0.5,
+      defaultClampOverlap: true,
+    },
+    subdivide: {
+      defaultCuts: 1,
+      defaultSmoothness: 0,
+      defaultFractal: 0,
+    },
+    inset: {
+      defaultThickness: 0.25,
+      defaultDepth: 0,
+      defaultIndividual: false,
+    },
+    loopCut: {
+      defaultCuts: 1,
+      defaultSlide: 0,
+    },
+    mergeByDistance: {
+      defaultDistance: 0.005,
+    },
+    dissolveLimited: {
+      defaultMaxAngleDeg: 5,
+      defaultDissolveVertices: true,
+    },
+    move: {
+      defaultSubMode: 'free',
+    },
+  };
+}
+
+export const DEFAULT_TOOL_CONFIGS: ToolConfigurations =
+  createDefaultToolConfigs();
+
+export function normalizeToolConfigs(
+  raw?: Partial<ToolConfigurations> | null,
+): ToolConfigurations {
+  const base = createDefaultToolConfigs();
+  if (!raw) return base;
+
+  const num = (v: unknown, fallback: number): number =>
+    typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+  const clamp = (v: number, min: number, max: number): number =>
+    Math.max(min, Math.min(max, v));
+  const extrudeAxis = (v: unknown): ExtrudeDefaultAxis =>
+    v === 'normal' || v === 'x' || v === 'y' || v === 'z'
+      ? v
+      : base.extrude.defaultAxis;
+  const moveSubMode = (v: unknown): MoveSubMode =>
+    v === 'free' || v === 'axis' || v === 'slide' ? v : base.move.defaultSubMode;
+
+  return {
+    extrude: {
+      defaultDistance: num(raw.extrude?.defaultDistance, base.extrude.defaultDistance),
+      defaultAxis: extrudeAxis(raw.extrude?.defaultAxis),
+      defaultIndividual:
+        typeof raw.extrude?.defaultIndividual === 'boolean'
+          ? raw.extrude.defaultIndividual
+          : base.extrude.defaultIndividual,
+    },
+    bevel: {
+      defaultWidth: clamp(num(raw.bevel?.defaultWidth, base.bevel.defaultWidth), 0.001, 5),
+      defaultSegments: Math.round(
+        clamp(num(raw.bevel?.defaultSegments, base.bevel.defaultSegments), 1, 5),
+      ),
+      defaultProfile: clamp(num(raw.bevel?.defaultProfile, base.bevel.defaultProfile), 0.1, 1),
+      defaultClampOverlap:
+        typeof raw.bevel?.defaultClampOverlap === 'boolean'
+          ? raw.bevel.defaultClampOverlap
+          : base.bevel.defaultClampOverlap,
+    },
+    subdivide: {
+      defaultCuts: Math.round(
+        clamp(num(raw.subdivide?.defaultCuts, base.subdivide.defaultCuts), 1, 6),
+      ),
+      defaultSmoothness: clamp(
+        num(raw.subdivide?.defaultSmoothness, base.subdivide.defaultSmoothness),
+        0,
+        1,
+      ),
+      defaultFractal: clamp(
+        num(raw.subdivide?.defaultFractal, base.subdivide.defaultFractal),
+        0,
+        0.5,
+      ),
+    },
+    inset: {
+      defaultThickness: clamp(
+        num(raw.inset?.defaultThickness, base.inset.defaultThickness),
+        0.01,
+        0.95,
+      ),
+      defaultDepth: num(raw.inset?.defaultDepth, base.inset.defaultDepth),
+      defaultIndividual:
+        typeof raw.inset?.defaultIndividual === 'boolean'
+          ? raw.inset.defaultIndividual
+          : base.inset.defaultIndividual,
+    },
+    loopCut: {
+      defaultCuts: Math.round(
+        clamp(num(raw.loopCut?.defaultCuts, base.loopCut.defaultCuts), 1, 24),
+      ),
+      defaultSlide: clamp(num(raw.loopCut?.defaultSlide, base.loopCut.defaultSlide), -1, 1),
+    },
+    mergeByDistance: {
+      defaultDistance: Math.max(
+        0.0001,
+        num(raw.mergeByDistance?.defaultDistance, base.mergeByDistance.defaultDistance),
+      ),
+    },
+    dissolveLimited: {
+      defaultMaxAngleDeg: clamp(
+        num(raw.dissolveLimited?.defaultMaxAngleDeg, base.dissolveLimited.defaultMaxAngleDeg),
+        0.1,
+        180,
+      ),
+      defaultDissolveVertices:
+        typeof raw.dissolveLimited?.defaultDissolveVertices === 'boolean'
+          ? raw.dissolveLimited.defaultDissolveVertices
+          : base.dissolveLimited.defaultDissolveVertices,
+    },
+    move: {
+      defaultSubMode: moveSubMode(raw.move?.defaultSubMode),
+    },
+  };
+}
+
 export const DEFAULT_MODELER_SETTINGS: ModelerSettings = {
   displayMode: 'solid',
   xrayTransparency: 50,
@@ -90,6 +274,7 @@ export const DEFAULT_MODELER_SETTINGS: ModelerSettings = {
   multiSelectTouch: false,
   proportionalEditing: { ...DEFAULT_PROPORTIONAL_EDITING_SETTINGS },
   touch: createDefaultTouchSettings(),
+  toolConfigs: createDefaultToolConfigs(),
 };
 
 export function normalizeTouchSettings(
@@ -173,6 +358,7 @@ export function loadSettingsLocally(): ModelerSettings {
       return {
         ...DEFAULT_MODELER_SETTINGS,
         touch: createDefaultTouchSettings(),
+        toolConfigs: createDefaultToolConfigs(),
       };
     }
     const parsed = JSON.parse(raw) as Partial<ModelerSettings>;
@@ -191,12 +377,14 @@ export function loadSettingsLocally(): ModelerSettings {
         parsed.proportionalEditing,
       ),
       touch: normalizeTouchSettings(parsed.touch),
+      toolConfigs: normalizeToolConfigs(parsed.toolConfigs),
     };
   } catch {
     return {
       ...DEFAULT_MODELER_SETTINGS,
       proportionalEditing: { ...DEFAULT_PROPORTIONAL_EDITING_SETTINGS },
       touch: createDefaultTouchSettings(),
+      toolConfigs: createDefaultToolConfigs(),
     };
   }
 }

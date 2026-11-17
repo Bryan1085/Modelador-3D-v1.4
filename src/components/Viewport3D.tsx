@@ -14,7 +14,6 @@ import {
 } from '../core/mesh/advancedOperations';
 import { EditSelectionMode } from '../core/mesh/operations';
 import { PrimitiveOptions, PrimitiveType } from '../core/mesh/primitives';
-import { ProportionalFalloff } from '../core/mesh/proportionalEditing';
 import {
   AxisConstraint,
   CameraProjection,
@@ -22,7 +21,6 @@ import {
   ObjectTransform,
   SceneObjectData,
   TouchControlSettings,
-  TouchModifierKey,
   TouchModifierState,
   TransformTool,
   WorkMode,
@@ -50,9 +48,7 @@ import { AxisGizmoHandle, AxisGizmoWidget } from './AxisGizmoWidget';
 import { CtrlAltOperationsMenu } from './CtrlAltOperationsMenu';
 import { CtrlShiftPrimitivesMenu } from './CtrlShiftPrimitivesMenu';
 import { EditOperatorBar } from './EditOperatorBar';
-import { FloatingModifierPanel } from './FloatingModifierPanel';
 import { FloatingRadialMenu } from './FloatingRadialMenu';
-import { ProportionalEditingBar } from './ProportionalEditingBar';
 import {
   ContextMenuState,
   ViewportContextMenu,
@@ -60,6 +56,7 @@ import {
 
 export interface Viewport3DHandle {
   focusSelected: () => void;
+  confirmMoveSlide: () => boolean;
 }
 
 interface Viewport3DProps {
@@ -74,6 +71,7 @@ interface Viewport3DProps {
   activeTool: TransformTool;
   axisConstraint: AxisConstraint;
   projection: CameraProjection;
+  cameraRotationLocked?: boolean;
   settings: ModelerSettings;
   meshRevision: number;
   toastMessage: string | null;
@@ -124,9 +122,8 @@ interface Viewport3DProps {
   onToggleGrid: () => void;
   onToggleMultiSelectTouch: () => void;
   onToggleScreenShift: () => void;
-  onSetScreenModifier: (key: TouchModifierKey, active: boolean) => void;
-  onToggleScreenModifier: (key: TouchModifierKey) => void;
   onReleaseScreenModifiers: () => void;
+  onEffectiveModifiersChange?: (mods: TouchModifierState) => void;
   onUpdateTouchSettings: (patch: Partial<TouchControlSettings>) => void;
   onUpdateRadialSlot: (
     mode: RadialWorkMode,
@@ -160,17 +157,14 @@ interface Viewport3DProps {
   onFlipNormals: () => void;
   onQuickDissolve: () => void;
   onExecuteContextualDelete: (action: DeleteActionType) => void;
-  proportionalModifierWarning?: string | null;
   onToggleProportional: () => void;
   onToggleProportionalConnected: () => void;
-  onChangeProportionalFalloff: (falloff: ProportionalFalloff) => void;
   onChangeProportionalRadius: (radius: number) => void;
   onSaveProject: () => void;
   onOpenSettings: () => void;
   modalTransform?: ModalTransformState | null;
   modalCancelNonce?: number;
-  onGQuickTapMove?: () => void;
-  onGHoldSlide?: () => void;
+  onToggleCameraRotationLock?: () => void;
   onChangeModalClamp?: (clamp: boolean) => void;
   onCancelModalTransform?: () => void;
   onCompleteModalTransform?: (committed: boolean) => void;
@@ -190,6 +184,7 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
       activeTool,
       axisConstraint,
       projection,
+      cameraRotationLocked = false,
       settings,
       meshRevision,
       toastMessage,
@@ -228,9 +223,8 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
       onToggleGrid,
       onToggleMultiSelectTouch,
       onToggleScreenShift,
-      onSetScreenModifier,
-      onToggleScreenModifier,
       onReleaseScreenModifiers,
+      onEffectiveModifiersChange,
       onUpdateTouchSettings,
       onUpdateRadialSlot,
       onResetRadialSlot,
@@ -257,17 +251,14 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
       onFlipNormals,
       onQuickDissolve,
       onExecuteContextualDelete,
-      proportionalModifierWarning = null,
       onToggleProportional,
       onToggleProportionalConnected,
-      onChangeProportionalFalloff,
       onChangeProportionalRadius,
       onSaveProject,
       onOpenSettings,
       modalTransform = null,
       modalCancelNonce = 0,
-      onGQuickTapMove,
-      onGHoldSlide,
+      onToggleCameraRotationLock,
       onChangeModalClamp,
       onCancelModalTransform,
       onCompleteModalTransform,
@@ -391,6 +382,9 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
       () => ({
         focusSelected() {
           engineRef.current?.setCameraPreset('focus');
+        },
+        confirmMoveSlide() {
+          return engineRef.current?.confirmModalSlidePreview() ?? false;
         },
       }),
       [],
@@ -626,8 +620,10 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
           ? (operatorSession.config.params.cursorPosition ?? [0, 0, 0])
           : null,
       modalTransformMode: modalTransform?.mode ?? null,
+      modalTransformCommitOnRelease: modalTransform?.commitOnRelease ?? true,
       modalSlideClamp: modalTransform?.clamp ?? true,
       modalCancelNonce,
+      cameraRotationLocked,
     });
   }, [
     objects,
@@ -639,6 +635,7 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
     activeTool,
     axisConstraint,
     projection,
+    cameraRotationLocked,
     settings,
     meshRevision,
     operatorSession,
@@ -695,6 +692,10 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
     [gestureModifiers, physicalModifiers, screenModifiers],
   );
 
+  useEffect(() => {
+    onEffectiveModifiersChange?.(effectiveModifiers);
+  }, [effectiveModifiers, onEffectiveModifiersChange]);
+
   return (
     <main className="relative flex-1 min-w-0 h-full flex flex-col bg-[#1d1f24] overflow-hidden select-none">
       {/* Dedicated WebGL Mount Container */}
@@ -742,91 +743,30 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
           </div>
         )}
 
-        {/* Top-Center: Proportional Editing HUD & Contextual Edge Topology Sub-tool in Edit Mode */}
-        {workMode === 'edit' && !operatorSession && (
-          <ProportionalEditingBar
-            config={settings.proportionalEditing}
-            hasSelection={selectedComponentIds.size > 0}
-            modifierWarning={proportionalModifierWarning}
-            onToggleEnabled={onToggleProportional}
-            onToggleConnectedOnly={onToggleProportionalConnected}
-            onChangeFalloff={onChangeProportionalFalloff}
-            onChangeRadius={onChangeProportionalRadius}
-          >
-            {editSelectionMode === 'edge' && onChangeEdgeSelectionTool && (
-              <div
-                className="pointer-events-auto flex items-center gap-0.5 p-0.5 rounded-lg bg-[#181a1f]/95 border border-[#343a47] shadow-lg"
-                title="Modo de selección de aristas al tocar"
-              >
-                <span className="px-1.5 text-[10px] font-semibold uppercase tracking-wide text-[#8e95a5]">
-                  Sel. Arista
-                </span>
-                {(
-                  [
-                    { id: 'single', label: 'Arista' },
-                    { id: 'loop', label: 'Bucle' },
-                    { id: 'ring', label: 'Anillo' },
-                  ] as const
-                ).map((item) => {
-                  const active = edgeSelectionTool === item.id;
-                  return (
-                    <button
-                      key={item.id}
-                      type="button"
-                      onClick={() => onChangeEdgeSelectionTool(item.id)}
-                      className={`px-2 py-1 rounded text-[11px] font-medium transition-colors ${
-                        active
-                          ? 'bg-[#ff9900] text-[#111215] font-semibold'
-                          : 'text-[#d1d5db] hover:bg-[#2a2f3a]'
-                      }`}
-                    >
-                      {item.label}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </ProportionalEditingBar>
-        )}
-
-        {/* Active CTRL + Drag Virtual Trackball HUD Indicator */}
+        {/* Top-Left: Trackball HUD Indicator only (tool & sub-mode selectors moved to LeftToolSidebar) */}
         {trackballActive && (
-          <div
-            data-testid="trackball-active-indicator"
-            className="absolute top-3 left-3 z-20 px-2.5 py-1.5 rounded-lg bg-[#122536] border border-[#38bdf8] text-[#7dd3fc] text-[11px] font-semibold flex items-center gap-1.5 shadow-lg pointer-events-none"
-          >
-            <Rotate3d className="w-3.5 h-3.5 text-[#38bdf8]" />
-            <span>
-              Rotación Trackball ({workMode === 'edit' ? 'Edición' : 'Objeto'})
-            </span>
+          <div className="absolute top-3 left-3 z-15 pointer-events-none">
+            <div
+              data-testid="trackball-active-indicator"
+              className="px-2.5 py-1.5 rounded-lg bg-[#122536] border border-[#38bdf8] text-[#7dd3fc] text-[11px] font-semibold flex items-center gap-1.5 shadow-lg pointer-events-none"
+            >
+              <Rotate3d className="w-3.5 h-3.5 text-[#38bdf8]" />
+              <span>
+                Rotación Trackball ({workMode === 'edit' ? 'Edición' : 'Objeto'})
+              </span>
+            </div>
           </div>
         )}
 
-        {/* Top-Right: Interactive Z-Up Orientation Gizmo */}
-        <div className="absolute top-3 right-3 z-10 pointer-events-none">
+        {/* Top-Right: Interactive Z-Up Orientation Gizmo & Camera Rotation Lock */}
+        <div className="absolute top-3 right-3 z-15 pointer-events-none">
           <AxisGizmoWidget
             ref={gizmoRef}
+            cameraRotationLocked={cameraRotationLocked}
             onSelectPreset={handleSelectCameraPreset}
+            onToggleCameraRotationLock={onToggleCameraRotationLock}
           />
         </div>
-
-        {/* ZBrush-inspired Movable Floating Modifiers Panel (SHIFT / CTRL / ALT + G) */}
-        <FloatingModifierPanel
-          containerRef={viewportContainerRef}
-          settings={settings.touch}
-          effectiveModifiers={effectiveModifiers}
-          virtualModifiers={screenModifiers}
-          activeTool={activeTool}
-          modalTransformMode={modalTransform?.mode ?? null}
-          onSetModifier={onSetScreenModifier}
-          onToggleModifier={onToggleScreenModifier}
-          onReleaseAll={onReleaseScreenModifiers}
-          onChangeBehaviorMode={(mode) =>
-            onUpdateTouchSettings({ modifierPanelMode: mode })
-          }
-          onGQuickTapMove={onGQuickTapMove}
-          onGHoldSlide={onGHoldSlide}
-        />
 
         {/* Floating Draggable Button & Customizable Radial Menu */}
         {settings.touch.floatingMenuEnabled && !operatorSession && (
@@ -1093,10 +1033,21 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
               type="button"
               data-testid="modal-transform-cancel"
               onClick={() => onCancelModalTransform?.()}
-              className="px-2.5 py-1 rounded-lg bg-[#2c191c] hover:bg-[#3f2024] border border-[#e05252]/60 text-[#fca5a5] text-[11px] font-bold transition-colors"
+              className="px-2.5 py-1 rounded-lg bg-[#2c191c] hover:bg-[#3f2024] border border-[#e05252]/60 text-[#fca5a5] text-[11px] font-bold transition-colors touch-manipulation"
             >
               Cancelar
             </button>
+
+            {!modalTransform.commitOnRelease && (
+              <button
+                type="button"
+                data-testid="modal-transform-confirm"
+                onClick={() => engineRef.current?.confirmModalSlidePreview()}
+                className="px-2.5 py-1 rounded-lg bg-[#22d3ee] hover:bg-[#67e8f9] text-[#0f1115] text-[11px] font-bold transition-colors touch-manipulation"
+              >
+                Confirmar
+              </button>
+            )}
           </div>
         )}
 

@@ -1,6 +1,8 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Check,
+  ChevronDown,
+  ChevronUp,
   Columns,
   FlipHorizontal,
   GitMerge,
@@ -94,10 +96,18 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
   onCancel,
 }) => {
   const { config, baseSelectionMode, baseSelectedIds } = session;
+  const [isExtrudeCollapsed, setIsExtrudeCollapsed] = useState(false);
+
+  useEffect(() => {
+    setIsExtrudeCollapsed(false);
+  }, [session.objectId, config.type, session.baseSelectedIds]);
+
   const meta = OPERATOR_META[config.type];
   const isLoopCutMissingEdge =
     config.type === 'loop_cut' && !config.params.edgeId;
   const isConfirmDisabled = isLoopCutMissingEdge || Boolean(operatorError);
+  const showControlsBody =
+    config.type !== 'extrude' || !isExtrudeCollapsed;
 
   const renderNumberControl = (
     label: string,
@@ -106,6 +116,7 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
     max: number,
     step: number,
     onChange: (next: number) => void,
+    unboundedNumeric = false,
   ) => (
     <div className="flex items-center gap-2 min-w-[190px]">
       <span className="text-[11px] font-medium text-[#b4bac4] whitespace-nowrap">
@@ -116,23 +127,25 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
         min={min}
         max={max}
         step={step}
-        value={value}
+        value={Math.max(min, Math.min(max, value))}
         onChange={(e) => onChange(parseFloat(e.target.value))}
         className="w-24 accent-[#ff9900] cursor-pointer"
       />
       <input
         type="number"
-        min={min}
-        max={max}
+        min={unboundedNumeric ? undefined : min}
+        max={unboundedNumeric ? undefined : max}
         step={step}
-        value={Number(value.toFixed(3))}
+        value={Number(value.toFixed(4))}
         onChange={(e) => {
           const parsed = parseFloat(e.target.value);
-          if (!Number.isNaN(parsed)) {
-            onChange(Math.max(min, Math.min(max, parsed)));
+          if (Number.isFinite(parsed)) {
+            onChange(
+              unboundedNumeric ? parsed : Math.max(min, Math.min(max, parsed)),
+            );
           }
         }}
-        className="w-16 h-8 px-1.5 rounded bg-[#111317] border border-[#2f333d] text-xs font-mono-tabular text-[#f3f4f6] text-right focus:outline-none focus:border-[#ff9900]"
+        className="w-20 h-8 px-1.5 rounded bg-[#111317] border border-[#2f333d] text-xs font-mono-tabular text-[#f3f4f6] text-right focus:outline-none focus:border-[#ff9900]"
       />
     </div>
   );
@@ -171,14 +184,28 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
   );
 
   return (
-    <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-20 w-[min(96%,780px)] rounded-lg bg-[#181a1f] border border-[#363b47] shadow-2xl px-3 py-2.5 flex flex-col gap-2 pointer-events-auto">
+    <div
+      data-testid="edit-operator-bar"
+      onPointerDown={(e) => e.stopPropagation()}
+      onWheel={(e) => e.stopPropagation()}
+      className="absolute bottom-3 left-1/2 -translate-x-1/2 z-20 w-[min(96%,780px)] rounded-lg bg-[#181a1f] border border-[#363b47] shadow-2xl px-3 py-2.5 flex flex-col gap-2 pointer-events-auto"
+    >
       {/* Header + Confirm / Cancel */}
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex items-center justify-between gap-2 sm:gap-3">
         <div className="flex items-center gap-2 min-w-0">
           {meta.icon}
           <span className="text-xs font-semibold text-[#f3f4f6] tracking-wide whitespace-nowrap">
             {meta.title}
           </span>
+          {config.type === 'extrude' && isExtrudeCollapsed && (
+            <span className="px-2 py-0.5 rounded bg-[#23262e] border border-[#353a46] text-[11px] font-mono-tabular text-[#ff9900] whitespace-nowrap">
+              Dist: {config.params.distance.toFixed(2)} ·{' '}
+              {config.params.axis === 'normal'
+                ? 'Normal'
+                : config.params.axis.toUpperCase()}
+              {config.params.individual ? ' · Ind.' : ''}
+            </span>
+          )}
           {config.type === 'loop_cut' && !config.params.edgeId && (
             <span className="text-[11px] text-[#7dd3fc] truncate">
               · Toca una arista cuadrangular en el visor
@@ -214,10 +241,36 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          {config.type === 'extrude' && (
+            <button
+              type="button"
+              data-testid="extrude-collapse-toggle"
+              onClick={() => setIsExtrudeCollapsed((prev) => !prev)}
+              aria-expanded={!isExtrudeCollapsed}
+              title={
+                isExtrudeCollapsed
+                  ? 'Desplegar controles de Extrude'
+                  : 'Plegar panel de Extrude'
+              }
+              className="min-h-[38px] px-2.5 rounded-md bg-[#23262e] hover:bg-[#2f333d] border border-[#383e4a] text-xs font-medium text-[#d1d5db] flex items-center gap-1 transition-colors touch-manipulation"
+            >
+              {isExtrudeCollapsed ? (
+                <>
+                  <ChevronUp className="w-3.5 h-3.5 text-[#ff9900]" />
+                  <span>Desplegar</span>
+                </>
+              ) : (
+                <>
+                  <ChevronDown className="w-3.5 h-3.5 text-[#9ca3af]" />
+                  <span>Plegar</span>
+                </>
+              )}
+            </button>
+          )}
           <button
             type="button"
             onClick={onCancel}
-            className="min-h-[38px] px-3 rounded-md bg-[#23262e] hover:bg-[#2f333d] border border-[#383e4a] text-xs font-medium text-[#d1d5db] flex items-center gap-1.5 transition-colors"
+            className="min-h-[38px] px-3 rounded-md bg-[#23262e] hover:bg-[#2f333d] border border-[#383e4a] text-xs font-medium text-[#d1d5db] flex items-center gap-1.5 transition-colors touch-manipulation"
           >
             <X className="w-3.5 h-3.5 text-[#e06c75]" />
             <span>Cancelar</span>
@@ -226,7 +279,7 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
             type="button"
             onClick={onConfirm}
             disabled={isConfirmDisabled}
-            className="min-h-[38px] px-3.5 rounded-md bg-[#ff9900] hover:bg-[#ffa726] disabled:opacity-40 disabled:cursor-not-allowed text-xs font-bold text-[#111215] flex items-center gap-1.5 transition-colors"
+            className="min-h-[38px] px-3.5 rounded-md bg-[#ff9900] hover:bg-[#ffa726] disabled:opacity-40 disabled:cursor-not-allowed text-xs font-bold text-[#111215] flex items-center gap-1.5 transition-colors touch-manipulation"
           >
             <Check className="w-3.5 h-3.5" />
             <span>Confirmar</span>
@@ -241,20 +294,22 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
       )}
 
       {/* Dynamic Parameter Controls */}
+      {showControlsBody && (
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-1 border-t border-[#272a33]">
         {config.type === 'extrude' && (
           <>
             {renderNumberControl(
               'Distancia',
               config.params.distance,
-              -3,
-              3,
-              0.05,
+              -5,
+              5,
+              0.01,
               (distance) =>
                 onUpdateConfig({
                   type: 'extrude',
                   params: { ...config.params, distance },
                 }),
+              true,
             )}
 
             <div className="flex items-center gap-1">
@@ -330,14 +385,15 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
             {renderNumberControl(
               'Profundidad',
               config.params.depth,
-              -1,
-              1,
+              -2,
+              2,
               0.05,
               (depth) =>
                 onUpdateConfig({
                   type: 'inset',
                   params: { ...config.params, depth },
                 }),
+              true,
             )}
             <button
               type="button"
@@ -945,6 +1001,7 @@ export const EditOperatorBar: React.FC<EditOperatorBarProps> = ({
           </>
         )}
       </div>
+      )}
     </div>
   );
 };

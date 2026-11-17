@@ -10,9 +10,10 @@ import {
   ReferenceImageImportModal,
   StlImportModal,
 } from './components/FileIoModals';
+import { LeftToolSidebar } from './components/LeftToolSidebar';
 import { OutlinerPanel } from './components/OutlinerPanel';
 import { ProjectModal, ProjectModalMode } from './components/ProjectModal';
-import { SettingsModal } from './components/SettingsModal';
+import { SettingsModal, SettingsTabId } from './components/SettingsModal';
 import { SceneStatsInfo, TopBar } from './components/TopBar';
 import { Viewport3D, Viewport3DHandle } from './components/Viewport3D';
 import {
@@ -33,7 +34,9 @@ import {
   ObjectTransform,
   ReferenceImageOrientation,
   SceneObjectData,
+  TouchModifierState,
 } from './core/project/types';
+import { EMPTY_MODIFIER_STATE } from './engine/TouchGestureManager';
 import { useModelerStore } from './state/useModelerStore';
 
 export default function App() {
@@ -44,7 +47,10 @@ export default function App() {
   );
   const [projectModalMode, setProjectModalMode] =
     useState<ProjectModalMode | null>(null);
-  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [settingsModalTab, setSettingsModalTab] =
+    useState<SettingsTabId | null>(null);
+  const [effectiveModifiers, setEffectiveModifiers] =
+    useState<TouchModifierState>(EMPTY_MODIFIER_STATE);
   const viewportRef = useRef<Viewport3DHandle | null>(null);
   const [liveTransformOverride, setLiveTransformOverride] = useState<{
     id: string;
@@ -686,7 +692,7 @@ export default function App() {
         onOpenProjectModal={() => setProjectModalMode('open')}
         onSaveProject={store.saveProject}
         onSaveAsProjectModal={() => setProjectModalMode('save_as')}
-        onOpenSettingsModal={() => setShowSettingsModal(true)}
+        onOpenSettingsModal={() => setSettingsModalTab('touch')}
         onImportObj={() => objInputRef.current?.click()}
         onImportStl={() => stlInputRef.current?.click()}
         onImportJpg={() => jpgInputRef.current?.click()}
@@ -710,8 +716,90 @@ export default function App() {
         onToggleOutliner={() => setShowOutliner((prev) => !prev)}
       />
 
-      {/* Main Workspace: Full-Width 3D Viewport + Collapsible Outliner */}
+      {/* Main Workspace: Collapsible Left Tool Sidebar + 3D Viewport + Collapsible Outliner */}
       <div className="flex-1 min-h-0 flex overflow-hidden">
+        {/* B. Barra Lateral Izquierda Unificada de Herramientas */}
+        <LeftToolSidebar
+          workMode={store.workMode}
+          editSelectionMode={store.editSelectionMode}
+          edgeSelectionTool={store.edgeSelectionTool}
+          activeTool={store.activeTool}
+          moveSubMode={store.moveSubMode}
+          axisConstraint={store.axisConstraint}
+          activeOperatorType={store.operatorSession?.config.type ?? null}
+          modalTransformMode={store.modalTransform?.mode ?? null}
+          canEditSelected={canEditSelected}
+          hasSelectedObject={Boolean(store.selectedObject)}
+          hasSelectedComponents={store.selectedComponentIds.size > 0}
+          multiSelectTouch={store.settings.multiSelectTouch}
+          xrayEditMode={store.settings.displayMode === 'xray'}
+          showFaceOrientation={Boolean(store.settings.showFaceOrientation)}
+          showGrid={store.settings.showGrid}
+          proportionalConfig={store.settings.proportionalEditing}
+          proportionalModifierWarning={store.proportionalModifierWarning}
+          touchSettings={store.settings.touch}
+          effectiveModifiers={effectiveModifiers}
+          screenModifiers={store.screenModifiers}
+          onSelectTool={(tool) => {
+            if (store.operatorSession) store.cancelEditOperator();
+            store.setActiveTool(tool);
+          }}
+          onSelectMoveSubMode={store.setMoveSubMode}
+          onChangeAxisConstraint={store.setAxisConstraint}
+          onGQuickTapMove={store.triggerGQuickTapMove}
+          onGHoldSlide={store.triggerGHoldSlide}
+          onToggleWorkMode={store.toggleWorkMode}
+          onChangeEditSelectionMode={store.changeEditSelectionMode}
+          onChangeEdgeSelectionTool={store.setEdgeSelectionTool}
+          onToggleMultiSelectTouch={() =>
+            store.updateSettings({
+              multiSelectTouch: !store.settings.multiSelectTouch,
+            })
+          }
+          onSelectAll={() => {
+            if (store.workMode === 'edit') {
+              store.selectAllEditComponents();
+            } else {
+              store.selectAllSceneObjects();
+            }
+          }}
+          onDeselectAll={() => {
+            if (store.workMode === 'edit') {
+              store.deselectAllEditComponents();
+            } else {
+              store.deselectAllSceneObjects();
+            }
+          }}
+          onSelectConnected={store.selectConnectedEditComponents}
+          onSetModifier={store.setScreenModifier}
+          onToggleModifier={store.toggleScreenModifier}
+          onReleaseAllModifiers={store.releaseScreenModifiers}
+          onStartOperator={(type) => {
+            store.startEditOperator(type);
+          }}
+          onFillSelection={store.executeFillSelection}
+          onConnectVertexPath={store.executeConnectVertexPath}
+          onExecuteContextualDelete={store.executeContextualDelete}
+          onToggleFaceOrientation={store.toggleFaceOrientation}
+          onRecalculateOutside={store.executeRecalculateOutside}
+          onFlipNormals={store.executeFlipNormals}
+          onToggleXray={store.toggleXrayDisplayMode}
+          onToggleGrid={() =>
+            store.updateSettings({ showGrid: !store.settings.showGrid })
+          }
+          onToggleProportional={store.toggleProportionalEditing}
+          onToggleProportionalConnected={store.toggleProportionalConnected}
+          onChangeProportionalFalloff={store.setProportionalFalloff}
+          onChangeProportionalRadius={store.setProportionalRadius}
+          onAddPrimitive={(type, options) => store.addPrimitive(type, options)}
+          onDuplicateObject={store.duplicateSelectedObject}
+          onApplyObjectTransform={store.applyObjectTransform}
+          onCenterObjectOrigin={store.centerObjectOrigin}
+          onSeparateSelectedGeometry={store.separateSelectedGeometry}
+          onFocusCamera={() => viewportRef.current?.focusSelected()}
+          onOpenToolSettings={() => setSettingsModalTab('tools')}
+        />
+
         {/* C. Visor 3D */}
         <Viewport3D
           ref={viewportRef}
@@ -726,6 +814,7 @@ export default function App() {
           activeTool={store.activeTool}
           axisConstraint={store.axisConstraint}
           projection={store.projection}
+          cameraRotationLocked={store.cameraRotationLocked}
           settings={store.settings}
           meshRevision={store.meshRevision}
           toastMessage={store.toastMessage}
@@ -770,9 +859,8 @@ export default function App() {
             })
           }
           onToggleScreenShift={store.toggleScreenShift}
-          onSetScreenModifier={store.setScreenModifier}
-          onToggleScreenModifier={store.toggleScreenModifier}
           onReleaseScreenModifiers={store.releaseScreenModifiers}
+          onEffectiveModifiersChange={setEffectiveModifiers}
           onUpdateTouchSettings={store.updateTouchSettings}
           onUpdateRadialSlot={store.updateRadialSlot}
           onResetRadialSlot={store.resetRadialSlot}
@@ -802,17 +890,14 @@ export default function App() {
           onFlipNormals={store.executeFlipNormals}
           onQuickDissolve={store.executeQuickDissolve}
           onExecuteContextualDelete={store.executeContextualDelete}
-          proportionalModifierWarning={store.proportionalModifierWarning}
           onToggleProportional={store.toggleProportionalEditing}
           onToggleProportionalConnected={store.toggleProportionalConnected}
-          onChangeProportionalFalloff={store.setProportionalFalloff}
           onChangeProportionalRadius={store.setProportionalRadius}
           onSaveProject={store.saveProject}
-          onOpenSettings={() => setShowSettingsModal(true)}
+          onOpenSettings={() => setSettingsModalTab('touch')}
           modalTransform={store.modalTransform}
           modalCancelNonce={store.modalCancelNonce}
-          onGQuickTapMove={store.triggerGQuickTapMove}
-          onGHoldSlide={store.triggerGHoldSlide}
+          onToggleCameraRotationLock={store.toggleCameraRotationLock}
           onChangeModalClamp={store.setModalTransformClamp}
           onCancelModalTransform={store.cancelModalTransform}
           onCompleteModalTransform={store.completeModalTransform}
@@ -889,10 +974,11 @@ export default function App() {
         />
       )}
 
-      {showSettingsModal && (
+      {settingsModalTab && (
         <SettingsModal
           settings={store.settings}
           sceneStats={sceneStats}
+          initialTab={settingsModalTab}
           onUpdateSettings={store.updateSettings}
           onUpdateTouchSettings={store.updateTouchSettings}
           onUpdateTouchModifier={store.updateTouchModifier}
@@ -900,7 +986,11 @@ export default function App() {
           onResetRadialSlot={store.resetRadialSlot}
           onResetRadialLayout={store.resetRadialLayout}
           onResetTouchSettings={store.resetTouchSettings}
-          onClose={() => setShowSettingsModal(false)}
+          onUpdateToolConfig={store.updateToolConfig}
+          onUpdateProportionalSettings={store.updateProportionalSettings}
+          onResetToolConfig={store.resetToolConfig}
+          onResetAllToolConfigs={store.resetAllToolConfigs}
+          onClose={() => setSettingsModalTab(null)}
         />
       )}
 

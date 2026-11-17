@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useImperativeHandle, useRef } from 'react';
-import { Rotate3d } from 'lucide-react';
+import { Lock, Rotate3d, Unlock } from 'lucide-react';
 import * as THREE from 'three';
 import {
   CameraPreset,
@@ -155,13 +155,15 @@ export function projectAxisTips(
 }
 
 interface AxisGizmoWidgetProps {
+  cameraRotationLocked?: boolean;
   onSelectPreset: (preset: Exclude<CameraPreset, 'focus'>) => void;
+  onToggleCameraRotationLock?: () => void;
 }
 
 export const AxisGizmoWidget = React.forwardRef<
   AxisGizmoHandle,
   AxisGizmoWidgetProps
->(({ onSelectPreset }, ref) => {
+>(({ cameraRotationLocked = false, onSelectPreset, onToggleCameraRotationLock }, ref) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const quatRef = useRef<CameraQuaternionTuple>([0, 0, 0, 1]);
   const tipsRef = useRef<ProjectedAxisTip[]>([]);
@@ -291,61 +293,97 @@ export const AxisGizmoWidget = React.forwardRef<
 
   return (
     <div
-      className="select-none pointer-events-auto flex flex-col items-center gap-1"
+      className="select-none pointer-events-auto flex items-start gap-1.5"
       aria-label="Gizmo de orientación Z-up"
       onPointerDown={(e) => {
         e.stopPropagation();
       }}
     >
-      <canvas
-        ref={canvasRef}
-        style={{
-          width: `${GIZMO_CANVAS_SIZE}px`,
-          height: `${GIZMO_CANVAS_SIZE}px`,
-          touchAction: 'none',
-        }}
-        className="block cursor-pointer"
-        onPointerEnter={() => {
-          bgHoverRef.current = true;
-          draw();
-        }}
-        onPointerMove={(e) => {
-          const hit = hitTestTip(e.clientX, e.clientY);
-          const nextId = hit ? hit.id : null;
-          if (hoveredIdRef.current !== nextId) {
-            hoveredIdRef.current = nextId;
+      <div className="flex flex-col items-center gap-1">
+        <canvas
+          ref={canvasRef}
+          style={{
+            width: `${GIZMO_CANVAS_SIZE}px`,
+            height: `${GIZMO_CANVAS_SIZE}px`,
+            touchAction: 'none',
+          }}
+          className="block cursor-pointer"
+          onPointerEnter={() => {
+            bgHoverRef.current = true;
             draw();
-          }
-        }}
-        onPointerLeave={() => {
-          bgHoverRef.current = false;
-          hoveredIdRef.current = null;
-          draw();
-        }}
-        onPointerUp={(e) => {
-          e.stopPropagation();
-          const hit = hitTestTip(e.clientX, e.clientY);
-          if (!hit) return;
-          // If already aligned strictly along this axis tip toward viewer, flip to opposite view (Blender behavior)
-          const targetPreset =
-            hit.vz > 0.995 ? hit.oppositePreset : hit.preset;
-          onSelectPreset(targetPreset);
-        }}
-      />
+          }}
+          onPointerMove={(e) => {
+            const hit = hitTestTip(e.clientX, e.clientY);
+            const nextId = hit ? hit.id : null;
+            if (hoveredIdRef.current !== nextId) {
+              hoveredIdRef.current = nextId;
+              draw();
+            }
+          }}
+          onPointerLeave={() => {
+            bgHoverRef.current = false;
+            hoveredIdRef.current = null;
+            draw();
+          }}
+          onPointerUp={(e) => {
+            e.stopPropagation();
+            const hit = hitTestTip(e.clientX, e.clientY);
+            if (!hit) return;
+            // If already aligned strictly along this axis tip toward viewer, flip to opposite view (Blender behavior)
+            const targetPreset =
+              hit.vz > 0.995 ? hit.oppositePreset : hit.preset;
+            onSelectPreset(targetPreset);
+          }}
+        />
 
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation();
-          onSelectPreset('iso');
-        }}
-        title="Volver a vista 3D libre (Perspectiva)"
-        aria-label="Volver a vista 3D libre"
-        className="h-8 px-2.5 rounded-md bg-[#181a1f]/90 hover:bg-[#242832] active:bg-[#2e3340] border border-[#323642] text-[11px] font-semibold text-[#d1d5db] hover:text-[#ff9900] flex items-center gap-1 shadow-md transition-colors touch-manipulation"
-      >
-        <Rotate3d className="w-3.5 h-3.5 text-[#ff9900]" />
-        <span>3D</span>
-      </button>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            data-testid="reset-3d-view"
+            onClick={(e) => {
+              e.stopPropagation();
+              onSelectPreset('iso');
+            }}
+            title="Restablecer vista 3D"
+            aria-label="Restablecer vista 3D"
+            className="h-8 px-2.5 rounded-md border bg-[#181a1f]/92 hover:bg-[#242832] active:bg-[#2e3340] border-[#323642] text-[11px] font-semibold text-[#d1d5db] hover:text-[#ff9900] flex items-center gap-1 shadow-md transition-colors touch-manipulation whitespace-nowrap"
+          >
+            <Rotate3d className="w-3.5 h-3.5 text-[#ff9900]" />
+            <span>3D</span>
+          </button>
+
+          <button
+            type="button"
+            data-testid="camera-rotation-lock-toggle"
+            aria-pressed={cameraRotationLocked}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleCameraRotationLock?.();
+            }}
+            title={
+              cameraRotationLocked
+                ? 'Rotación de cámara bloqueada (tocar para desbloquear)'
+                : 'Bloquear rotación de cámara (mantiene zoom, pan y herramientas)'
+            }
+            aria-label={
+              cameraRotationLocked
+                ? 'Desbloquear rotación de cámara'
+                : 'Bloquear rotación de cámara'
+            }
+            className={`w-8 h-8 rounded-md border flex items-center justify-center shadow-md transition-colors touch-manipulation ${
+              cameraRotationLocked
+                ? 'bg-[#2a1f10] hover:bg-[#3a2a14] border-[#ff9900] text-[#ffb84d]'
+                : 'bg-[#181a1f]/92 hover:bg-[#242832] border-[#323642] text-[#cbd5e1] hover:text-white'
+            }`}
+          >
+            {cameraRotationLocked ? (
+              <Lock className="w-3.5 h-3.5 text-[#ff9900]" />
+            ) : (
+              <Unlock className="w-3.5 h-3.5" />
+            )}
+          </button>
+        </div>
+      </div>
     </div>
   );
 });

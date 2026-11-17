@@ -8,6 +8,7 @@ import {
   deleteSelectedComponents,
   EditSelectionMode,
   selectAllComponents,
+  selectConnectedComponents,
   separateGeometryFromMesh,
 } from '../core/mesh/operations';
 import {
@@ -24,16 +25,20 @@ import {
   RadialWorkMode,
 } from '../core/radial/radialActions';
 import {
+  createDefaultToolConfigs,
   createNewProject,
   createDefaultTouchSettings,
+  DEFAULT_MODELER_SETTINGS,
   deleteProjectLocally,
   generateId,
   getActiveStoredProjectId,
   listSavedProjects,
   loadInitialProject,
+  loadLastGizmoMode,
   loadProjectFromAnyStorage,
   loadProjectLocally,
   loadSettingsLocally,
+  saveLastGizmoMode,
   saveProjectLocally,
   saveSettingsLocally,
 } from '../core/project/storage';
@@ -107,7 +112,10 @@ import { LoadedImageReferencePayload } from '../core/io/imageReference';
 import {
   AxisConstraint,
   CameraProjection,
+  ConfigurableToolKey,
+  GizmoTransformMode,
   ModelerSettings,
+  MoveSubMode,
   ObjectTransform,
   ProjectData,
   ProjectSummary,
@@ -115,6 +123,7 @@ import {
   ReferenceImageOrientation,
   SceneData,
   SceneObjectData,
+  ToolConfigurations,
   TouchControlSettings,
   TouchModifierKey,
   TouchModifierSlotConfig,
@@ -123,6 +132,15 @@ import {
   ViewportDisplayMode,
   WorkMode,
 } from '../core/project/types';
+import {
+  DEFAULT_PROPORTIONAL_EDITING_SETTINGS as DEFAULT_PROP_SETTINGS,
+} from '../core/mesh/proportionalEditing';
+
+export type ToolResetTarget =
+  | ConfigurableToolKey
+  | 'rotate'
+  | 'scale'
+  | 'proportional';
 import { SerializedEditableMesh } from '../core/mesh/EditableMesh';
 import {
   applySingleModifierToMesh,
@@ -207,6 +225,8 @@ export type ModalGMode = 'move' | 'vertex_slide' | 'edge_slide';
 export interface ModalTransformState {
   mode: ModalGMode;
   clamp: boolean;
+  commitOnRelease?: boolean;
+  source?: 'g_button' | 'move_tool';
 }
 
 interface HistorySnapshot {
@@ -251,12 +271,26 @@ export function useModelerStore() {
     () => new Set(),
   );
 
-  const [activeTool, setActiveToolState] = useState<TransformTool>('move');
-  const [axisConstraint, setAxisConstraint] = useState<AxisConstraint>('free');
-  const [projection, setProjection] = useState<CameraProjection>('perspective');
   const [settings, setSettings] = useState<ModelerSettings>(() =>
     loadSettingsLocally(),
   );
+  const [activeTool, setActiveToolState] = useState<TransformTool>(() =>
+    loadLastGizmoMode(),
+  );
+  const [axisConstraint, setAxisConstraintState] = useState<AxisConstraint>(() =>
+    settings.toolConfigs.move.defaultSubMode === 'axis' ? 'x' : 'free',
+  );
+  const [moveSubMode, setMoveSubModeState] = useState<MoveSubMode>(() =>
+    settings.toolConfigs.move.defaultSubMode === 'axis' ? 'axis' : 'free',
+  );
+  const [projection, setProjectionState] = useState<CameraProjection>('perspective');
+  const [cameraRotationLocked, setCameraRotationLocked] = useState<boolean>(false);
+  const setProjection = useCallback((next: CameraProjection) => {
+    setProjectionState(next);
+  }, []);
+  const toggleCameraRotationLock = useCallback(() => {
+    setCameraRotationLocked((prev) => !prev);
+  }, []);
 
   const [meshRevision, setMeshRevision] = useState(0);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -291,13 +325,55 @@ export function useModelerStore() {
   }, []);
   const setActiveTool = useCallback(
     (tool: TransformTool) => {
+      const switchingToMove = tool === 'move' && activeTool !== 'move';
       setActiveToolState(tool);
+      if (
+        tool === 'move' ||
+        tool === 'rotate' ||
+        tool === 'scale' ||
+        tool === 'all'
+      ) {
+        saveLastGizmoMode(tool as GizmoTransformMode);
+      }
       if (tool !== 'move') {
-        setModalTransform(null);
+        setModalTransform((prev) => {
+          if (prev) setModalCancelNonce((n) => n + 1);
+          return null;
+        });
+        setMoveSubModeState(axisConstraint === 'free' ? 'free' : 'axis');
+      } else if (switchingToMove) {
+        const defaultMoveMode = settings.toolConfigs.move.defaultSubMode;
+        if (defaultMoveMode === 'axis') {
+          setMoveSubModeState('axis');
+          setAxisConstraintState((prev) => (prev === 'free' ? 'x' : prev));
+        } else {
+          setAxisConstraintState('free');
+          setMoveSubModeState('free');
+        }
       }
       releaseScreenModifiers();
     },
-    [releaseScreenModifiers],
+    [
+      activeTool,
+      axisConstraint,
+      releaseScreenModifiers,
+      settings.toolConfigs.move.defaultSubMode,
+    ],
+  );
+
+  const setAxisConstraint = useCallback(
+    (axis: AxisConstraint) => {
+      setAxisConstraintState(axis);
+      setModalTransform((prev) => {
+        if (prev?.source === 'move_tool') {
+          setModalCancelNonce((n) => n + 1);
+          return null;
+        }
+        return prev;
+      });
+      setMoveSubModeState(axis === 'free' ? 'free' : 'axis');
+    },
+    [],
   );
   const [operatorSession, setOperatorSession] =
     useState<EditOperatorSession | null>(null);
@@ -1859,6 +1935,37 @@ export function useModelerStore() {
     setSelectedComponentIds(new Set());
   }, []);
 
+  const selectConnectedEditComponents = useCallback(() => {
+    if (!selectedObject || workMode !== 'edit') return;
+    if (selectedComponentIds.size === 0) {
+      showToast('Selecciona al menos un elemento para seleccionar conectados');
+      return;
+    }
+    const mesh = EditableMesh.fromJSON(selectedObject.mesh);
+    const connected = selectConnectedComponents(
+      mesh,
+      editSelectionMode,
+      selectedComponentIds,
+    );
+    setSelectedComponentIds(connected);
+  }, [editSelectionMode, selectedComponentIds, selectedObject, showToast, workMode]);
+
+  const selectAllSceneObjects = useCallback(() => {
+    if (workMode !== 'object') return;
+    const visibleIds = activeObjects.filter((o) => o.visible).map((o) => o.id);
+    if (visibleIds.length === 0) return;
+    setSelectedObjectIds(new Set(visibleIds));
+    setSelectedObjectId((curr) =>
+      curr && visibleIds.includes(curr) ? curr : visibleIds[0],
+    );
+  }, [activeObjects, workMode]);
+
+  const deselectAllSceneObjects = useCallback(() => {
+    if (workMode !== 'object') return;
+    setSelectedObjectId(null);
+    setSelectedObjectIds(new Set());
+  }, [workMode]);
+
   const deleteSelectedEditComponents = useCallback(() => {
     if (!selectedObject || workMode !== 'edit') return;
     if (selectedComponentIds.size === 0) {
@@ -2336,6 +2443,94 @@ export function useModelerStore() {
     showToast('Controles táctiles y menú radial restaurados');
   }, [showToast]);
 
+  const updateToolConfig = useCallback(
+    <K extends ConfigurableToolKey>(
+      toolKey: K,
+      patch: Partial<ToolConfigurations[K]>,
+    ) => {
+      setSettings((prev) => {
+        const next: ModelerSettings = {
+          ...prev,
+          toolConfigs: {
+            ...prev.toolConfigs,
+            [toolKey]: {
+              ...prev.toolConfigs[toolKey],
+              ...patch,
+            },
+          },
+        };
+        saveSettingsLocally(next);
+        return next;
+      });
+    },
+    [],
+  );
+
+  const resetToolConfig = useCallback(
+    (target: ToolResetTarget) => {
+      const defaults = createDefaultToolConfigs();
+      setSettings((prev) => {
+        let next: ModelerSettings = prev;
+        if (target === 'rotate') {
+          next = {
+            ...prev,
+            snapRotateDeg: DEFAULT_MODELER_SETTINGS.snapRotateDeg,
+          };
+        } else if (target === 'scale') {
+          next = {
+            ...prev,
+            snapScaleStep: DEFAULT_MODELER_SETTINGS.snapScaleStep,
+          };
+        } else if (target === 'proportional') {
+          next = {
+            ...prev,
+            proportionalEditing: { ...DEFAULT_PROP_SETTINGS },
+          };
+        } else if (target === 'move') {
+          next = {
+            ...prev,
+            snapTranslateStep: DEFAULT_MODELER_SETTINGS.snapTranslateStep,
+            toolConfigs: {
+              ...prev.toolConfigs,
+              move: { ...defaults.move },
+            },
+          };
+        } else {
+          next = {
+            ...prev,
+            toolConfigs: {
+              ...prev.toolConfigs,
+              [target]: { ...defaults[target] },
+            },
+          };
+        }
+        saveSettingsLocally(next);
+        return next;
+      });
+      showToast('Configuración de herramienta restaurada');
+    },
+    [showToast],
+  );
+
+  const resetAllToolConfigs = useCallback(() => {
+    const defaults = createDefaultToolConfigs();
+    setSettings((prev) => {
+      const next: ModelerSettings = {
+        ...prev,
+        snapEnabled: DEFAULT_MODELER_SETTINGS.snapEnabled,
+        snapTranslateStep: DEFAULT_MODELER_SETTINGS.snapTranslateStep,
+        snapRotateDeg: DEFAULT_MODELER_SETTINGS.snapRotateDeg,
+        snapScaleStep: DEFAULT_MODELER_SETTINGS.snapScaleStep,
+        gizmoSize: DEFAULT_MODELER_SETTINGS.gizmoSize,
+        proportionalEditing: { ...DEFAULT_PROP_SETTINGS },
+        toolConfigs: defaults,
+      };
+      saveSettingsLocally(next);
+      return next;
+    });
+    showToast('Todas las herramientas restauradas a valores predeterminados');
+  }, [showToast]);
+
   const updateSelectedVerticesPosition = useCallback(
     (axis: 0 | 1 | 2, targetValue: number) => {
       if (
@@ -2714,7 +2909,11 @@ export function useModelerStore() {
           baseSelectedIds: baseIds,
           config: {
             type: 'loop_cut',
-            params: { edgeId: initialEdgeId, cuts: 1, slide: 0 },
+            params: {
+              edgeId: initialEdgeId,
+              cuts: settings.toolConfigs.loopCut.defaultCuts,
+              slide: settings.toolConfigs.loopCut.defaultSlide,
+            },
           },
         });
         return;
@@ -2733,7 +2932,7 @@ export function useModelerStore() {
           config: {
             type: 'merge_by_distance',
             params: {
-              distance: 0.005,
+              distance: settings.toolConfigs.mergeByDistance.defaultDistance,
               scope: baseIds.length > 0 ? 'selection' : 'all',
             },
           },
@@ -2754,8 +2953,9 @@ export function useModelerStore() {
           config: {
             type: 'dissolve_limited',
             params: {
-              maxAngleDeg: 5,
-              dissolveVertices: true,
+              maxAngleDeg: settings.toolConfigs.dissolveLimited.defaultMaxAngleDeg,
+              dissolveVertices:
+                settings.toolConfigs.dissolveLimited.defaultDissolveVertices,
               scope: baseIds.length > 0 ? 'selection' : 'all',
             },
           },
@@ -2807,7 +3007,11 @@ export function useModelerStore() {
           baseSelectedIds: baseIds,
           config: {
             type: 'extrude',
-            params: { distance: 0.5, axis: 'normal', individual: false },
+            params: {
+              distance: settings.toolConfigs.extrude.defaultDistance,
+              axis: settings.toolConfigs.extrude.defaultAxis,
+              individual: settings.toolConfigs.extrude.defaultIndividual,
+            },
           },
         });
       } else if (type === 'inset') {
@@ -2831,7 +3035,11 @@ export function useModelerStore() {
           baseSelectedIds: baseIds,
           config: {
             type: 'inset',
-            params: { thickness: 0.25, depth: 0, individual: false },
+            params: {
+              thickness: settings.toolConfigs.inset.defaultThickness,
+              depth: settings.toolConfigs.inset.defaultDepth,
+              individual: settings.toolConfigs.inset.defaultIndividual,
+            },
           },
         });
       } else if (type === 'subdivide') {
@@ -2846,7 +3054,11 @@ export function useModelerStore() {
           baseSelectedIds: baseIds,
           config: {
             type: 'subdivide',
-            params: { cuts: 1, smoothness: 0, fractal: 0 },
+            params: {
+              cuts: settings.toolConfigs.subdivide.defaultCuts,
+              smoothness: settings.toolConfigs.subdivide.defaultSmoothness,
+              fractal: settings.toolConfigs.subdivide.defaultFractal,
+            },
           },
         });
       } else if (type === 'bevel') {
@@ -2857,7 +3069,12 @@ export function useModelerStore() {
           baseSelectedIds: baseIds,
           config: {
             type: 'bevel',
-            params: { width: 0.2, segments: 1, profile: 0.5, clampOverlap: true },
+            params: {
+              width: settings.toolConfigs.bevel.defaultWidth,
+              segments: settings.toolConfigs.bevel.defaultSegments,
+              profile: settings.toolConfigs.bevel.defaultProfile,
+              clampOverlap: settings.toolConfigs.bevel.defaultClampOverlap,
+            },
           },
         });
       } else if (type === 'merge') {
@@ -2890,6 +3107,7 @@ export function useModelerStore() {
       releaseScreenModifiers,
       selectedComponentIds,
       selectedObject,
+      settings.toolConfigs,
       showToast,
       workMode,
     ],
@@ -2932,14 +3150,14 @@ export function useModelerStore() {
           config: {
             type: 'merge_by_distance',
             params: {
-              distance: 0.005,
+              distance: settings.toolConfigs.mergeByDistance.defaultDistance,
               scope: prev.baseSelectedIds.length > 0 ? 'selection' : 'all',
             },
           },
         };
       });
     },
-    [cursor3D, showToast],
+    [cursor3D, settings.toolConfigs.mergeByDistance.defaultDistance, showToast],
   );
 
   const pickLoopCutEdge = useCallback(
@@ -3123,6 +3341,21 @@ export function useModelerStore() {
 
     let res;
     if (cfg.type === 'extrude') {
+      if (Math.abs(cfg.params.distance) < 1e-8) {
+        return {
+          previewMesh: null,
+          previewSelectedIds: null,
+          previewNextMode: null,
+          loopCutSegments: [] as [Vec3, Vec3][],
+          loopCutRingEdgeIds: [] as string[],
+          loopCutFaceIds: [] as string[],
+          loopCutIsClosed: false,
+          loopCutError: null,
+          operatorError: null,
+          operatorStatusMessage: null,
+          mergedCount: 0,
+        };
+      }
       res = extrudeMesh(baseMesh, mode, baseSel, cfg.params);
     } else if (cfg.type === 'inset') {
       res = insetFacesMesh(baseMesh, mode, baseSel, cfg.params);
@@ -3677,6 +3910,8 @@ export function useModelerStore() {
     setOperatorSession(null);
     releaseScreenModifiers();
     setActiveToolState('move');
+    saveLastGizmoMode('move');
+    setMoveSubModeState(axisConstraint === 'free' ? 'free' : 'axis');
 
     if (!selectedObject) {
       setModalTransform(null);
@@ -3694,8 +3929,14 @@ export function useModelerStore() {
       return;
     }
 
-    setModalTransform({ mode: 'move', clamp: true });
+    setModalTransform({
+      mode: 'move',
+      clamp: true,
+      commitOnRelease: true,
+      source: 'g_button',
+    });
   }, [
+    axisConstraint,
     releaseScreenModifiers,
     selectedComponentIds.size,
     selectedObject,
@@ -3709,6 +3950,7 @@ export function useModelerStore() {
 
     if (!selectedObject) {
       setActiveToolState('move');
+      saveLastGizmoMode('move');
       setModalTransform(null);
       showToast('Selecciona un objeto o componente primero');
       return;
@@ -3722,8 +3964,14 @@ export function useModelerStore() {
     // Object Mode or Face Mode falls back cleanly to Move (per design spec)
     if (workMode === 'object' || editSelectionMode === 'face') {
       setActiveToolState('move');
+      saveLastGizmoMode('move');
       if (workMode === 'object' || selectedComponentIds.size > 0) {
-        setModalTransform({ mode: 'move', clamp: true });
+        setModalTransform({
+          mode: 'move',
+          clamp: true,
+          commitOnRelease: true,
+          source: 'g_button',
+        });
       } else {
         setModalTransform(null);
       }
@@ -3748,7 +3996,12 @@ export function useModelerStore() {
         showToast(plan.reason ?? 'No hay aristas conectadas para Vertex Slide');
         return;
       }
-      setModalTransform({ mode: 'vertex_slide', clamp: true });
+      setModalTransform({
+        mode: 'vertex_slide',
+        clamp: true,
+        commitOnRelease: true,
+        source: 'g_button',
+      });
       return;
     }
 
@@ -3764,7 +4017,12 @@ export function useModelerStore() {
       showToast(plan.reason ?? 'No hay caras vecinas válidas para Edge Slide');
       return;
     }
-    setModalTransform({ mode: 'edge_slide', clamp: true });
+    setModalTransform({
+      mode: 'edge_slide',
+      clamp: true,
+      commitOnRelease: true,
+      source: 'g_button',
+    });
   }, [
     editSelectionMode,
     releaseScreenModifiers,
@@ -3774,6 +4032,119 @@ export function useModelerStore() {
     workMode,
   ]);
 
+  const setMoveSubMode = useCallback(
+    (mode: MoveSubMode) => {
+      if (mode === 'free') {
+        setModalTransform((prev) => {
+          if (prev?.source === 'move_tool') {
+            setModalCancelNonce((n) => n + 1);
+            return null;
+          }
+          return prev;
+        });
+        setAxisConstraintState('free');
+        setMoveSubModeState('free');
+        return;
+      }
+
+      if (mode === 'axis') {
+        setModalTransform((prev) => {
+          if (prev?.source === 'move_tool') {
+            setModalCancelNonce((n) => n + 1);
+            return null;
+          }
+          return prev;
+        });
+        setMoveSubModeState('axis');
+        setAxisConstraintState((prev) => (prev === 'free' ? 'x' : prev));
+        return;
+      }
+
+      // Slide mode inside Move tool
+      setOperatorSession(null);
+      releaseScreenModifiers();
+      setActiveToolState('move');
+      saveLastGizmoMode('move');
+
+      if (!selectedObject) {
+        showToast('Selecciona un objeto y vértices o aristas en Modo Edición');
+        return;
+      }
+      if (selectedObject.locked) {
+        showToast('El objeto está bloqueado');
+        return;
+      }
+      if (workMode !== 'edit') {
+        showToast('Slide solo está disponible en Modo Edición (vértices o aristas)');
+        return;
+      }
+      if (editSelectionMode === 'face') {
+        showToast('Slide aplica a vértices o aristas; cambia a Vértice o Arista');
+        return;
+      }
+      if (selectedComponentIds.size === 0) {
+        showToast(
+          editSelectionMode === 'vertex'
+            ? 'Selecciona al menos un vértice para Vertex Slide'
+            : 'Selecciona al menos una arista para Edge Slide',
+        );
+        return;
+      }
+
+      const mesh = EditableMesh.fromJSON(selectedObject.mesh);
+      if (editSelectionMode === 'vertex') {
+        const plan = buildVertexSlidePlan(mesh, selectedComponentIds);
+        if (!plan.valid) {
+          showToast(plan.reason ?? 'No hay aristas conectadas para Vertex Slide');
+          return;
+        }
+        setMoveSubModeState('slide');
+        setModalTransform({
+          mode: 'vertex_slide',
+          clamp: true,
+          commitOnRelease: false,
+          source: 'move_tool',
+        });
+        return;
+      }
+
+      const plan = buildEdgeSlidePlan(mesh, selectedComponentIds);
+      if (!plan.valid) {
+        showToast(plan.reason ?? 'No hay caras vecinas válidas para Edge Slide');
+        return;
+      }
+      setMoveSubModeState('slide');
+      setModalTransform({
+        mode: 'edge_slide',
+        clamp: true,
+        commitOnRelease: false,
+        source: 'move_tool',
+      });
+    },
+    [
+      editSelectionMode,
+      releaseScreenModifiers,
+      selectedComponentIds,
+      selectedObject,
+      showToast,
+      workMode,
+    ],
+  );
+
+  // Reset uncommitted Move->Slide session if workMode / selection submode / object changes
+  useEffect(() => {
+    setModalTransform((prev) => {
+      if (prev?.source === 'move_tool') {
+        setModalCancelNonce((n) => n + 1);
+        return null;
+      }
+      return prev;
+    });
+    setMoveSubModeState((curr) =>
+      curr === 'slide' ? (axisConstraint === 'free' ? 'free' : 'axis') : curr,
+    );
+  }, [workMode, editSelectionMode, selectedObjectId, selectedComponentIds, axisConstraint]);
+
   const setModalTransformClamp = useCallback((clamp: boolean) => {
     setModalTransform((prev) => (prev ? { ...prev, clamp } : prev));
   }, []);
@@ -3781,13 +4152,18 @@ export function useModelerStore() {
   const cancelModalTransform = useCallback(() => {
     setModalCancelNonce((n) => n + 1);
     setModalTransform(null);
-  }, []);
+    setMoveSubModeState(axisConstraint === 'free' ? 'free' : 'axis');
+  }, [axisConstraint]);
 
-  const completeModalTransform = useCallback((committed: boolean) => {
-    if (committed) {
-      setModalTransform(null);
-    }
-  }, []);
+  const completeModalTransform = useCallback(
+    (committed: boolean) => {
+      if (committed) {
+        setModalTransform(null);
+        setMoveSubModeState(axisConstraint === 'free' ? 'free' : 'axis');
+      }
+    },
+    [axisConstraint],
+  );
 
   return {
     project,
@@ -3810,7 +4186,9 @@ export function useModelerStore() {
     proportionalModifierWarning,
     activeTool,
     axisConstraint,
+    moveSubMode,
     projection,
+    cameraRotationLocked,
     settings,
     meshRevision,
     toastMessage,
@@ -3830,6 +4208,7 @@ export function useModelerStore() {
     loopCutIsClosed: operatorPreview.loopCutIsClosed,
     loopCutError: operatorPreview.loopCutError,
     setActiveTool,
+    setMoveSubMode,
     triggerGQuickTapMove,
     triggerGHoldSlide,
     setModalTransformClamp,
@@ -3837,6 +4216,8 @@ export function useModelerStore() {
     completeModalTransform,
     setAxisConstraint,
     setProjection,
+    setCameraRotationLocked,
+    toggleCameraRotationLock,
     setProjectName,
     saveProject,
     saveProjectAs,
@@ -3881,6 +4262,9 @@ export function useModelerStore() {
     showToast,
     selectAllEditComponents,
     deselectAllEditComponents,
+    selectConnectedEditComponents,
+    selectAllSceneObjects,
+    deselectAllSceneObjects,
     deleteSelectedEditComponents,
     executeContextualDelete,
     executeFillSelection,
@@ -3915,6 +4299,9 @@ export function useModelerStore() {
     resetRadialSlot,
     resetRadialLayout,
     resetTouchSettings,
+    updateToolConfig,
+    resetToolConfig,
+    resetAllToolConfigs,
     updateSelectedVerticesPosition,
     addModifier,
     updateModifier,
