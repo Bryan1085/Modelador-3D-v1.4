@@ -10,8 +10,14 @@ import {
   ReferenceImageImportModal,
   StlImportModal,
 } from './components/FileIoModals';
+import {
+  RecoveryPromptModal,
+  ReturnToGalleryModal,
+} from './components/GalleryModals';
 import { LeftToolSidebar } from './components/LeftToolSidebar';
+import { NewProjectModal } from './components/NewProjectModal';
 import { OutlinerPanel } from './components/OutlinerPanel';
+import { ProjectGallery } from './components/ProjectGallery';
 import { ProjectModal, ProjectModalMode } from './components/ProjectModal';
 import { SettingsModal, SettingsTabId } from './components/SettingsModal';
 import { SceneStatsInfo, TopBar } from './components/TopBar';
@@ -32,6 +38,7 @@ import { inspectStlBuffer, parseStlBuffer } from './core/io/stlImport';
 import { evaluateObjectsForExport } from './core/modifiers/evaluateModifiers';
 import {
   ObjectTransform,
+  ProjectTemplateId,
   ReferenceImageOrientation,
   SceneObjectData,
   TouchModifierState,
@@ -41,6 +48,10 @@ import { useModelerStore } from './state/useModelerStore';
 
 export default function App() {
   const store = useModelerStore();
+
+  const [activeView, setActiveView] = useState<'gallery' | 'modeler'>('gallery');
+  const [showReturnGuardModal, setShowReturnGuardModal] = useState(false);
+  const [exitingToGallery, setExitingToGallery] = useState(false);
 
   const [showOutliner, setShowOutliner] = useState(() =>
     typeof window !== 'undefined' ? window.innerWidth >= 1024 : true,
@@ -80,6 +91,30 @@ export default function App() {
   const stlInputRef = useRef<HTMLInputElement | null>(null);
   const jpgInputRef = useRef<HTMLInputElement | null>(null);
   const pngInputRef = useRef<HTMLInputElement | null>(null);
+  const nativeProjectInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    store.registerThumbnailProvider(
+      () => viewportRef.current?.captureThumbnail() ?? null,
+    );
+    return () => store.registerThumbnailProvider(null);
+  }, [store.registerThumbnailProvider]);
+
+  useEffect(() => {
+    store.setModelerActive(activeView === 'modeler');
+  }, [activeView, store.setModelerActive]);
+
+  // Prompt confirmation before closing browser tab if there are unsaved changes in active modeler session
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (activeView === 'modeler' && store.hasUnsavedChanges) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [activeView, store.hasUnsavedChanges]);
 
   const handleLiveObjectTransform = useCallback(
     (id: string, transform: ObjectTransform) => {
@@ -402,9 +437,106 @@ export default function App() {
     [store],
   );
 
-  // Keyboard shortcuts for iPad Magic Keyboard / Desktop testing
+  const enterModelerWithResetCamera = useCallback(() => {
+    setActiveView('modeler');
+    window.requestAnimationFrame(() => {
+      viewportRef.current?.resetCamera();
+    });
+  }, []);
+
+  const handleOpenProjectFromGallery = useCallback(
+    async (projectId: string): Promise<boolean> => {
+      const opened = await store.openProject(projectId);
+      if (opened) {
+        enterModelerWithResetCamera();
+      }
+      return opened;
+    },
+    [enterModelerWithResetCamera, store],
+  );
+
+  const handleCreateProjectFromGallery = useCallback(
+    async (
+      name: string,
+      templateId: ProjectTemplateId,
+      folderId: string | null,
+    ) => {
+      const created = await store.createProject(name, templateId, folderId);
+      if (created) {
+        enterModelerWithResetCamera();
+      }
+      return created;
+    },
+    [enterModelerWithResetCamera, store],
+  );
+
+  const handleReturnToGallery = useCallback(async () => {
+    if (exitingToGallery) return;
+    if (store.hasUnsavedChanges) {
+      if (store.settings.autosaveEnabled) {
+        setExitingToGallery(true);
+        const savedOk = await store.saveProjectSilent();
+        setExitingToGallery(false);
+        if (savedOk) {
+          setActiveView('gallery');
+          return;
+        }
+      }
+      setShowReturnGuardModal(true);
+      return;
+    }
+
+    const thumb = viewportRef.current?.captureThumbnail();
+    if (thumb) {
+      await store.saveProjectSilent(thumb);
+    }
+    setActiveView('gallery');
+  }, [exitingToGallery, store]);
+
+  const handleExportNativeFromModeler = useCallback(async () => {
+    const res = await store.exportNativeProject();
+    if (!res) return;
+    triggerFileDownload(
+      res.content,
+      res.filename,
+      'application/json;charset=utf-8',
+    );
+    store.showToast(`Proyecto exportado: ${res.filename}`);
+  }, [store]);
+
+  const handleImportNativeFromModeler = useCallback(
+    async (fileList: FileList | null) => {
+      if (!fileList || fileList.length === 0) return;
+      try {
+        const text = await fileList[0].text();
+        const res = await store.importNativeProject(text);
+        if (!res.ok || !res.project) {
+          setIoError({
+            title: 'Error al importar proyecto',
+            message: res.error ?? 'No se pudo leer el archivo .forma3d.',
+          });
+          return;
+        }
+        const opened = await store.openProject(res.project.id, {
+          skipRecoveryCheck: true,
+        });
+        if (opened) {
+          enterModelerWithResetCamera();
+        }
+      } catch {
+        setIoError({
+          title: 'Error al importar proyecto',
+          message: 'No se pudo leer el archivo seleccionado.',
+        });
+      }
+    },
+    [enterModelerWithResetCamera, store],
+  );
+
+  // Keyboard shortcuts for iPad Magic Keyboard / Desktop testing (only active inside modeler)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (activeView !== 'modeler') return;
       const target = e.target as HTMLElement | null;
       if (
         target &&
@@ -425,7 +557,7 @@ export default function App() {
       }
       if (ctrlHeld && e.key.toLowerCase() === 's') {
         e.preventDefault();
-        store.saveProject();
+        void store.saveProject();
         return;
       }
 
@@ -584,7 +716,7 @@ export default function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [store]);
+  }, [activeView, store]);
 
   const canEditSelected = Boolean(
     store.selectedObject &&
@@ -672,11 +804,23 @@ export default function App() {
           e.target.value = '';
         }}
       />
+      <input
+        ref={nativeProjectInputRef}
+        type="file"
+        accept=".forma3d,.json,.forma3d.json,application/json"
+        className="hidden"
+        onChange={(e) => {
+          void handleImportNativeFromModeler(e.target.files);
+          e.target.value = '';
+        }}
+      />
 
       {/* A. Barra Superior Compacta y Desplegable */}
       <TopBar
         projectName={store.project.name}
         hasUnsavedChanges={store.hasUnsavedChanges}
+        saveStatus={store.saveStatus}
+        lastSaveError={store.lastSaveError}
         workMode={store.workMode}
         editSelectionMode={store.editSelectionMode}
         canEditSelected={canEditSelected}
@@ -688,10 +832,19 @@ export default function App() {
         projection={store.projection}
         showOutliner={showOutliner}
         sceneStats={sceneStats}
+        onReturnToGallery={() => {
+          void handleReturnToGallery();
+        }}
         onCreateProjectModal={() => setProjectModalMode('create')}
         onOpenProjectModal={() => setProjectModalMode('open')}
-        onSaveProject={store.saveProject}
+        onSaveProject={() => {
+          void store.saveProject();
+        }}
         onSaveAsProjectModal={() => setProjectModalMode('save_as')}
+        onImportNativeProject={() => nativeProjectInputRef.current?.click()}
+        onExportNativeProject={() => {
+          void handleExportNativeFromModeler();
+        }}
         onOpenSettingsModal={() => setSettingsModalTab('touch')}
         onImportObj={() => objInputRef.current?.click()}
         onImportStl={() => stlInputRef.current?.click()}
@@ -893,10 +1046,13 @@ export default function App() {
           onToggleProportional={store.toggleProportionalEditing}
           onToggleProportionalConnected={store.toggleProportionalConnected}
           onChangeProportionalRadius={store.setProportionalRadius}
-          onSaveProject={store.saveProject}
+          onSaveProject={() => {
+            void store.saveProject();
+          }}
           onOpenSettings={() => setSettingsModalTab('touch')}
           modalTransform={store.modalTransform}
           modalCancelNonce={store.modalCancelNonce}
+          paused={activeView !== 'modeler'}
           onToggleCameraRotationLock={store.toggleCameraRotationLock}
           onChangeModalClamp={store.setModalTransformClamp}
           onCancelModalTransform={store.cancelModalTransform}
@@ -958,19 +1114,121 @@ export default function App() {
         )}
       </div>
 
+      {/* Project Gallery Launch Screen Overlay (preserves single ViewportEngine instance underneath) */}
+      {activeView === 'gallery' && (
+        <ProjectGallery
+          projects={store.savedProjects}
+          folders={store.folders}
+          activeProjectId={store.project.id}
+          hasActiveUnsavedChanges={store.hasUnsavedChanges}
+          startupRecoveryList={store.startupRecoveryList}
+          isReady={store.isGalleryReady}
+          toastMessage={store.toastMessage}
+          onOpenProject={handleOpenProjectFromGallery}
+          onCreateProject={handleCreateProjectFromGallery}
+          onRenameProject={store.renameProjectById}
+          onDuplicateProject={store.duplicateProjectById}
+          onDeleteProjects={store.deleteProjectsByIds}
+          onMoveProjectsToFolder={store.moveProjectsToFolder}
+          onCreateFolder={store.createFolder}
+          onRenameFolder={store.renameFolder}
+          onDeleteFolder={store.deleteFolder}
+          onExportNativeProject={store.exportNativeProject}
+          onImportNativeProject={store.importNativeProject}
+          onApplyRecoveryDraft={async (record) => {
+            await store.applyRecoveryDraft(record);
+            enterModelerWithResetCamera();
+          }}
+          onDiscardRecoveryDraft={store.discardRecoveryDraft}
+          onNotify={store.showToast}
+        />
+      )}
+
       {/* Modals */}
-      {projectModalMode && (
+      {projectModalMode === 'create' && (
+        <NewProjectModal
+          folders={store.folders}
+          defaultFolderId={store.project.folderId ?? null}
+          onClose={() => setProjectModalMode(null)}
+          onCreate={async ({ name, templateId, folderId }) => {
+            const created = await handleCreateProjectFromGallery(
+              name,
+              templateId,
+              folderId,
+            );
+            if (created) setProjectModalMode(null);
+          }}
+        />
+      )}
+
+      {(projectModalMode === 'open' || projectModalMode === 'save_as') && (
         <ProjectModal
           initialMode={projectModalMode}
           currentProjectId={store.project.id}
           currentProjectName={store.project.name}
           savedProjects={store.savedProjects}
           onClose={() => setProjectModalMode(null)}
-          onCreateProject={store.createProject}
-          onSaveAsProject={store.saveProjectAs}
-          onOpenProject={store.openProject}
-          onSaveCurrent={store.saveProject}
-          onDeleteProject={store.removeSavedProject}
+          onCreateProject={(name) => {
+            void handleCreateProjectFromGallery(
+              name,
+              'cube',
+              store.project.folderId ?? null,
+            );
+          }}
+          onSaveAsProject={(name) => {
+            void store.saveProjectAs(name);
+          }}
+          onOpenProject={(id) => {
+            void handleOpenProjectFromGallery(id);
+          }}
+          onSaveCurrent={() => {
+            void store.saveProject();
+          }}
+          onDeleteProject={(id) => {
+            void store.removeSavedProject(id);
+          }}
+        />
+      )}
+
+      {showReturnGuardModal && (
+        <ReturnToGalleryModal
+          projectName={store.project.name}
+          saving={exitingToGallery}
+          onCancel={() => setShowReturnGuardModal(false)}
+          onDiscardAndExit={() => {
+            setShowReturnGuardModal(false);
+            setActiveView('gallery');
+          }}
+          onSaveAndExit={async () => {
+            setExitingToGallery(true);
+            const ok = await store.saveProjectSilent();
+            setExitingToGallery(false);
+            if (ok) {
+              setShowReturnGuardModal(false);
+              setActiveView('gallery');
+            }
+          }}
+        />
+      )}
+
+      {store.pendingRecovery && (
+        <RecoveryPromptModal
+          record={store.pendingRecovery}
+          onCancel={store.dismissPendingRecovery}
+          onRecover={async () => {
+            if (!store.pendingRecovery) return;
+            await store.applyRecoveryDraft(store.pendingRecovery);
+            enterModelerWithResetCamera();
+          }}
+          onDiscardDraft={async () => {
+            const targetId = store.pendingRecovery?.projectId;
+            if (!targetId) return;
+            await store.discardRecoveryDraft(targetId);
+            const opened = await store.openProject(targetId, {
+              skipRecoveryCheck: true,
+            });
+            if (opened) enterModelerWithResetCamera();
+          }}
         />
       )}
 

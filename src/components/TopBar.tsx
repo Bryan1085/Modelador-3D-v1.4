@@ -1,7 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AlertCircle,
+  ArrowLeft,
   Box,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronUp,
   CopyPlus,
@@ -15,6 +18,7 @@ import {
   Grid3X3,
   Image as ImageIcon,
   Layers,
+  Loader2,
   Lock,
   Menu,
   PanelRight,
@@ -28,6 +32,7 @@ import {
 import { EditSelectionMode } from '../core/mesh/operations';
 import {
   CameraProjection,
+  SaveStatus,
   ViewportDisplayMode,
   WorkMode,
 } from '../core/project/types';
@@ -56,6 +61,8 @@ export interface SceneStatsInfo {
 interface TopBarProps {
   projectName: string;
   hasUnsavedChanges: boolean;
+  saveStatus: SaveStatus;
+  lastSaveError?: string | null;
   workMode: WorkMode;
   editSelectionMode: EditSelectionMode;
   canEditSelected: boolean;
@@ -67,10 +74,13 @@ interface TopBarProps {
   projection: CameraProjection;
   showOutliner: boolean;
   sceneStats?: SceneStatsInfo;
+  onReturnToGallery: () => void;
   onCreateProjectModal: () => void;
   onOpenProjectModal: () => void;
   onSaveProject: () => void;
   onSaveAsProjectModal: () => void;
+  onImportNativeProject: () => void;
+  onExportNativeProject: () => void;
   onOpenSettingsModal: () => void;
   onImportObj: () => void;
   onImportStl: () => void;
@@ -94,6 +104,8 @@ interface TopBarProps {
 export const TopBar: React.FC<TopBarProps> = ({
   projectName,
   hasUnsavedChanges,
+  saveStatus,
+  lastSaveError = null,
   workMode,
   editSelectionMode,
   canEditSelected,
@@ -105,10 +117,13 @@ export const TopBar: React.FC<TopBarProps> = ({
   projection,
   showOutliner,
   sceneStats,
+  onReturnToGallery,
   onCreateProjectModal,
   onOpenProjectModal,
   onSaveProject,
   onSaveAsProjectModal,
+  onImportNativeProject,
+  onExportNativeProject,
   onOpenSettingsModal,
   onImportObj,
   onImportStl,
@@ -193,19 +208,72 @@ export const TopBar: React.FC<TopBarProps> = ({
 
   return (
     <>
-      <header className="h-12 shrink-0 bg-[#181a1f] border-b border-[#2b2e36] px-2.5 sm:px-3.5 flex items-center justify-between gap-3 z-30">
-        {/* Left: Brand & Active Project Name */}
-        <div className="hidden md:flex items-center gap-2 min-w-0 max-w-[220px] shrink">
-          <span className="text-xs font-bold tracking-tight text-[#f3f4f6] whitespace-nowrap shrink-0">
-            Forma3D
-          </span>
-          <span className="text-[#4b5563]" aria-hidden="true">
-            ·
-          </span>
-          <span className="text-xs text-[#9ca3af] truncate" title={projectName}>
-            {projectName}
-            {hasUnsavedChanges ? ' *' : ''}
-          </span>
+      <header className="h-12 shrink-0 bg-[#181a1f] border-b border-[#2b2e36] px-2 sm:px-3.5 flex items-center justify-between gap-2 z-30">
+        {/* Left: Back to Gallery + Active Project Name + Live Save Status */}
+        <div className="flex items-center gap-2 min-w-0 shrink">
+          <button
+            type="button"
+            data-testid="topbar-gallery-btn"
+            onClick={() => {
+              setOpenMenu(null);
+              onReturnToGallery();
+            }}
+            title="Volver a la galería de proyectos"
+            className="min-h-[38px] px-2.5 sm:px-3 rounded-md bg-[#22252d] hover:bg-[#2c313b] border border-[#323640] text-xs font-semibold text-[#e4e6eb] flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors touch-manipulation"
+          >
+            <ArrowLeft className="w-4 h-4 text-[#ff9900] shrink-0" />
+            <span>Galería</span>
+          </button>
+
+          <div className="hidden md:flex items-center gap-1.5 min-w-0 max-w-[200px]">
+            <span
+              className="text-xs font-semibold text-[#d1d5db] truncate"
+              title={projectName}
+            >
+              {projectName}
+            </span>
+          </div>
+
+          <button
+            type="button"
+            onClick={onSaveProject}
+            title={
+              saveStatus === 'error'
+                ? lastSaveError ?? 'Error al guardar'
+                : 'Guardar proyecto ahora (Ctrl+S)'
+            }
+            className={`hidden sm:flex min-h-[32px] px-2 rounded-md text-[11px] font-medium items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
+              saveStatus === 'error'
+                ? 'bg-[#331e22] text-[#fca5a5] border border-[#5c2c33]'
+                : saveStatus === 'saving'
+                  ? 'text-[#cbd5e1] bg-[#22252d]'
+                  : saveStatus === 'unsaved' || hasUnsavedChanges
+                    ? 'text-[#ff9900] hover:bg-[#252932]'
+                    : 'text-[#8e95a2] hover:bg-[#22252d] hover:text-[#e4e6eb]'
+            }`}
+          >
+            {saveStatus === 'saving' ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#ff9900]" />
+                <span>Guardando...</span>
+              </>
+            ) : saveStatus === 'error' ? (
+              <>
+                <AlertCircle className="w-3.5 h-3.5" />
+                <span>Error al guardar</span>
+              </>
+            ) : saveStatus === 'unsaved' || hasUnsavedChanges ? (
+              <>
+                <Save className="w-3.5 h-3.5" />
+                <span>Sin guardar</span>
+              </>
+            ) : (
+              <>
+                <CheckCircle2 className="w-3.5 h-3.5 text-[#34d399]" />
+                <span>Guardado</span>
+              </>
+            )}
+          </button>
         </div>
 
         {/* Center/Primary: 4 Main Compact Accesses (Archivo, Viewport, Modo, Panel) */}
@@ -328,6 +396,21 @@ export const TopBar: React.FC<TopBarProps> = ({
                 role="menuitem"
                 onClick={() => {
                   setOpenMenu(null);
+                  onReturnToGallery();
+                }}
+                className="w-full min-h-[42px] px-2.5 rounded-lg hover:bg-[#252932] active:bg-[#2e333f] text-xs font-semibold text-[#ff9900] flex items-center gap-2.5 text-left transition-colors"
+              >
+                <ArrowLeft className="w-4 h-4 shrink-0" />
+                <span>Volver a la galería</span>
+              </button>
+
+              <div className="my-1 border-t border-[#272b34]" />
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setOpenMenu(null);
                   onCreateProjectModal();
                 }}
                 className="w-full min-h-[42px] px-2.5 rounded-lg hover:bg-[#252932] active:bg-[#2e333f] text-xs font-medium text-[#e4e6eb] flex items-center gap-2.5 text-left transition-colors"
@@ -362,9 +445,17 @@ export const TopBar: React.FC<TopBarProps> = ({
                   <Save className="w-4 h-4 text-[#ff9900] shrink-0" />
                   <span>Guardar</span>
                 </span>
-                {hasUnsavedChanges && (
+                {saveStatus === 'error' ? (
+                  <span className="text-[10px] font-medium text-[#fca5a5]">
+                    Error
+                  </span>
+                ) : hasUnsavedChanges ? (
                   <span className="text-[10px] font-medium text-[#ff9900]">
                     Sin guardar
+                  </span>
+                ) : (
+                  <span className="text-[10px] font-medium text-[#34d399]">
+                    Guardado
                   </span>
                 )}
               </button>
@@ -380,6 +471,34 @@ export const TopBar: React.FC<TopBarProps> = ({
               >
                 <CopyPlus className="w-4 h-4 text-[#cbd5e1] shrink-0" />
                 <span>Guardar como</span>
+              </button>
+
+              <div className="my-1 border-t border-[#272b34]" />
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setOpenMenu(null);
+                  onImportNativeProject();
+                }}
+                className="w-full min-h-[40px] px-2.5 rounded-lg hover:bg-[#252932] text-xs font-medium text-[#e4e6eb] flex items-center gap-2.5 text-left transition-colors"
+              >
+                <Upload className="w-4 h-4 text-[#ff9900] shrink-0" />
+                <span>Importar proyecto (.forma3d)</span>
+              </button>
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setOpenMenu(null);
+                  onExportNativeProject();
+                }}
+                className="w-full min-h-[40px] px-2.5 rounded-lg hover:bg-[#252932] text-xs font-medium text-[#e4e6eb] flex items-center gap-2.5 text-left transition-colors"
+              >
+                <Download className="w-4 h-4 text-[#34d399] shrink-0" />
+                <span>Exportar proyecto (.forma3d)</span>
               </button>
 
               <div className="my-1 border-t border-[#272b34]" />

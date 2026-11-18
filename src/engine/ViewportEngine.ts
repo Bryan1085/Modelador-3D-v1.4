@@ -32,6 +32,7 @@ import {
   VertexSlidePlan,
   VertexSlideSelection,
 } from '../core/mesh/slideTools';
+import { encodeProjectThumbnailFromCanvas } from '../core/project/thumbnail';
 import {
   AxisConstraint,
   CameraProjection,
@@ -401,6 +402,7 @@ export class ViewportEngine {
   private cameraAnimTargetLook: THREE.Vector3 | null = null;
   private lastAnimTime = 0;
   private disposed = false;
+  private paused = false;
 
   private resizeObserver: ResizeObserver;
   private raycaster = new THREE.Raycaster();
@@ -4454,8 +4456,72 @@ export class ViewportEngine {
     this.requestRender();
   }
 
-  public requestRender(): void {
+  public setPaused(paused: boolean): void {
+    if (this.paused === paused) return;
+    this.paused = paused;
+    if (!paused && !this.disposed) {
+      this.handleResize();
+      this.requestRender();
+    }
+  }
+
+  public resetCameraToDefault(): void {
     if (this.disposed) return;
+    this.cameraAnimTargetPos = null;
+    this.cameraAnimTargetLook = null;
+    this.orbitControls.target.set(0, 0, 0);
+    this.perspectiveCamera.position.set(5.6, -6.2, 4.2);
+    this.perspectiveCamera.lookAt(0, 0, 0);
+    this.orthographicCamera.position.copy(this.perspectiveCamera.position);
+    this.orthographicCamera.lookAt(0, 0, 0);
+    this.orbitControls.update();
+    this.emitCameraPose();
+    if (!this.paused) {
+      this.requestRender();
+    }
+  }
+
+  public captureThumbnailDataUrl(width = 480, height = 320): string | null {
+    if (this.disposed) return null;
+    const tHelper = this.transformControls.getHelper();
+    const rHelper = this.rotateGizmoControls.getHelper();
+    const sHelper = this.scaleGizmoControls.getHelper();
+
+    const prevTVis = tHelper.visible;
+    const prevRVis = rHelper.visible;
+    const prevSVis = sHelper.visible;
+    const prevEditVis = this.editOverlayGroup.visible;
+    const prevRingVis = this.proportionalRing.visible;
+
+    try {
+      tHelper.visible = false;
+      rHelper.visible = false;
+      sHelper.visible = false;
+      this.editOverlayGroup.visible = false;
+      this.proportionalRing.visible = false;
+
+      this.renderer.render(this.scene, this.activeCamera);
+      return encodeProjectThumbnailFromCanvas(
+        this.renderer.domElement,
+        width,
+        height,
+      );
+    } catch {
+      return null;
+    } finally {
+      tHelper.visible = prevTVis;
+      rHelper.visible = prevRVis;
+      sHelper.visible = prevSVis;
+      this.editOverlayGroup.visible = prevEditVis;
+      this.proportionalRing.visible = prevRingVis;
+      if (!this.paused) {
+        this.requestRender();
+      }
+    }
+  }
+
+  public requestRender(): void {
+    if (this.disposed || this.paused) return;
     if (this.renderBusy) {
       this.renderDirty = true;
       return;

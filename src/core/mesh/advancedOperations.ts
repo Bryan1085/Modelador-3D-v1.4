@@ -240,6 +240,19 @@ export function extrudeMesh(
     return { mesh, nextSelectedIds: nextSelected };
   }
 
+  if (!Number.isFinite(distance) || Math.abs(distance) < 1e-8) {
+    for (const id of selectedIds) {
+      if (
+        (mode === 'vertex' && mesh.getVertex(id)) ||
+        (mode === 'edge' && mesh.getEdge(id)) ||
+        (mode === 'face' && mesh.getFace(id))
+      ) {
+        nextSelected.add(id);
+      }
+    }
+    return { mesh, nextSelectedIds: nextSelected };
+  }
+
   if (mode === 'vertex') {
     for (const vid of selectedIds) {
       const v = mesh.getVertex(vid);
@@ -305,6 +318,8 @@ export function extrudeMesh(
       if (extrudedEdgeId) nextSelected.add(extrudedEdgeId);
     }
 
+    mesh.clearCustomNormals();
+    mesh.rebuildIndices();
     return { mesh, nextSelectedIds: nextSelected };
   }
 
@@ -316,101 +331,20 @@ export function extrudeMesh(
 
   const reverseFaceWinding = (face: MeshFace) => {
     face.vertexIds.reverse();
-    if (face.uvs) {
+    if (face.uvs && face.uvs.length === face.vertexIds.length) {
       face.uvs.reverse();
     }
-    if (face.normals) {
+    if (face.normals && face.normals.length === face.vertexIds.length) {
       face.normals.reverse();
     }
   };
 
-  if (individual) {
-    const faceIdsToDelete = new Set<string>();
-
-    for (const face of selectedFaces) {
-      const faceNormal = mesh.computeFaceNormal(face);
-      const dir = axis === 'normal' ? faceNormal : axisVector(axis);
-      const offset = scaleVec(dir, distance);
-
-      // Keep and orient the original face ONLY if it is an isolated open single face
-      // (every edge belongs solely to this face, e.g. a Plane or disconnected polygon).
-      const edgeIds = mesh.getEdgesForFace(face.id);
-      const isIsolatedOpenFace =
-        edgeIds.length > 0 &&
-        edgeIds.every((eid) => mesh.getFacesForEdge(eid).length === 1);
-
-      const oldIds = [...face.vertexIds];
-      const newIds: string[] = [];
-      for (const vid of oldIds) {
-        const v = mesh.getVertex(vid);
-        if (!v) continue;
-        const pos = addVec(v.position, offset);
-        newIds.push(mesh.addVertex(pos[0], pos[1], pos[2]).id);
-      }
-      if (newIds.length !== oldIds.length) continue;
-
-      const flipOpenExtrusion =
-        isIsolatedOpenFace && dotVec(offset, faceNormal) < -1e-7;
-
-      if (isIsolatedOpenFace) {
-        if (!flipOpenExtrusion) {
-          reverseFaceWinding(face);
-        }
-      } else {
-        faceIdsToDelete.add(face.id);
-      }
-
-      const k = oldIds.length;
-      for (let i = 0; i < k; i++) {
-        const nextI = (i + 1) % k;
-        if (flipOpenExtrusion) {
-          mesh.addFace([oldIds[nextI], oldIds[i], newIds[i], newIds[nextI]]);
-        } else {
-          mesh.addFace([oldIds[i], oldIds[nextI], newIds[nextI], newIds[i]]);
-        }
-      }
-
-      const capVerts = flipOpenExtrusion ? [...newIds].reverse() : newIds;
-      const capFace = mesh.addFace(capVerts);
-      if (capFace) nextSelected.add(capFace.id);
-    }
-
-    if (faceIdsToDelete.size > 0) {
-      mesh.deleteFaces(faceIdsToDelete);
-    }
-    mesh.clearCustomNormals();
-    return { mesh, nextSelectedIds: nextSelected };
-  }
-
-  // REGION EXTRUDE (Connected faces share new extruded vertices)
+  // Count how many selected faces use each canonical edge & group selected faces into edge-connected islands
   const selectedFaceIdSet = new Set(selectedFaces.map((f) => f.id));
-  const vertexNormalsAccum = new Map<string, Vec3>();
-  const vertSet = new Set<string>();
-
-  for (const face of selectedFaces) {
-    const fn = mesh.computeFaceNormal(face);
-    for (const vid of face.vertexIds) {
-      vertSet.add(vid);
-      const prev = vertexNormalsAccum.get(vid) ?? [0, 0, 0];
-      vertexNormalsAccum.set(vid, addVec(prev, fn));
-    }
-  }
-
-  const vertMap = new Map<string, string>();
-  for (const vid of vertSet) {
-    const v = mesh.getVertex(vid);
-    if (!v) continue;
-    const dir =
-      axis === 'normal'
-        ? normVec(vertexNormalsAccum.get(vid) ?? [0, 0, 1])
-        : axisVector(axis);
-    const pos = addVec(v.position, scaleVec(dir, distance));
-    const nv = mesh.addVertex(pos[0], pos[1], pos[2]);
-    vertMap.set(vid, nv.id);
-  }
-
-  // Count how many selected faces use each canonical edge
+  const selectedFaceById = new Map(selectedFaces.map((f) => [f.id, f]));
   const edgeUseCountInSelection = new Map<string, number>();
+  const keyToSelectedFaceIds = new Map<string, string[]>();
+
   for (const face of selectedFaces) {
     const n = face.vertexIds.length;
     for (let i = 0; i < n; i++) {
@@ -418,17 +352,6 @@ export function extrudeMesh(
       const b = face.vertexIds[(i + 1) % n];
       const key = canonicalEdgeKey(a, b);
       edgeUseCountInSelection.set(key, (edgeUseCountInSelection.get(key) ?? 0) + 1);
-    }
-  }
-
-  // Group selected faces into edge-connected components so each island decides
-  // independently whether it is an isolated open sheet (keep base) or connected/closed.
-  const selectedFaceById = new Map(selectedFaces.map((f) => [f.id, f]));
-  const keyToSelectedFaceIds = new Map<string, string[]>();
-  for (const face of selectedFaces) {
-    const n = face.vertexIds.length;
-    for (let i = 0; i < n; i++) {
-      const key = canonicalEdgeKey(face.vertexIds[i], face.vertexIds[(i + 1) % n]);
       let list = keyToSelectedFaceIds.get(key);
       if (!list) {
         list = [];
@@ -439,10 +362,8 @@ export function extrudeMesh(
   }
 
   const visitedComp = new Set<string>();
-  const faceToIsolatedInfo = new Map<
-    string,
-    { isIsolatedOpen: boolean; flipWinding: boolean }
-  >();
+  const islandFacesList: MeshFace[][] = [];
+  const faceToIsIsolatedOpen = new Map<string, boolean>();
 
   for (const seed of selectedFaces) {
     if (visitedComp.has(seed.id)) continue;
@@ -468,23 +389,19 @@ export function extrudeMesh(
       }
     }
 
-    // Check boundary edges of this selected island:
-    // - Needs >= 1 boundary edge (closed shells have 0 and replace cleanly without double shells)
-    // - None of its boundary edges may touch an unselected face in the mesh
+    // Determine whether this selected island is an open surface with no unselected neighbor faces.
+    // - Open surface without unselected neighbors (e.g. a 1-face plane or all 4 faces of a subdivided plane):
+    //   keep the original faces as the back cap so the extruded result is a closed solid.
+    // - Closed shell (boundaryEdgeCount === 0) or patch bordering unselected faces (cube/solid face):
+    //   remove the original faces so no unnecessary internal dividing faces are left inside the volume.
     let boundaryEdgeCount = 0;
     let hasUnselectedNeighbor = false;
-    let avgNormal: Vec3 = [0, 0, 0];
-    let avgOffset: Vec3 = [0, 0, 0];
-    const compVerts = new Set<string>();
 
     for (const f of compFaces) {
-      const fn = mesh.computeFaceNormal(f);
-      avgNormal = addVec(avgNormal, fn);
       const n = f.vertexIds.length;
       for (let i = 0; i < n; i++) {
         const a = f.vertexIds[i];
         const b = f.vertexIds[(i + 1) % n];
-        compVerts.add(a);
         const key = canonicalEdgeKey(a, b);
         if (edgeUseCountInSelection.get(key) === 1) {
           boundaryEdgeCount++;
@@ -499,33 +416,162 @@ export function extrudeMesh(
       }
     }
 
-    for (const vid of compVerts) {
-      const v = mesh.getVertex(vid);
-      const nvId = vertMap.get(vid);
-      const nv = nvId ? mesh.getVertex(nvId) : undefined;
-      if (v && nv) {
-        avgOffset = addVec(avgOffset, subVec(nv.position, v.position));
+    const isIsolatedOpen = boundaryEdgeCount > 0 && !hasUnselectedNeighbor;
+    islandFacesList.push(compFaces);
+    for (const f of compFaces) {
+      faceToIsIsolatedOpen.set(f.id, isIsolatedOpen);
+    }
+  }
+
+  if (individual) {
+    const faceIdsToDelete = new Set<string>();
+
+    for (const face of selectedFaces) {
+      const faceNormal = mesh.computeFaceNormal(face);
+      const dir = axis === 'normal' ? faceNormal : axisVector(axis);
+      const offset = scaleVec(dir, distance);
+
+      const isIsolatedOpen = faceToIsIsolatedOpen.get(face.id) ?? false;
+
+      const oldIds = [...face.vertexIds];
+      const origUvs =
+        face.uvs && face.uvs.length === oldIds.length
+          ? face.uvs.map((uv) => [uv[0], uv[1]] as Vec2)
+          : undefined;
+      const newIds: string[] = [];
+      for (const vid of oldIds) {
+        const v = mesh.getVertex(vid);
+        if (!v) continue;
+        const pos = addVec(v.position, offset);
+        newIds.push(mesh.addVertex(pos[0], pos[1], pos[2]).id);
+      }
+      if (newIds.length !== oldIds.length) continue;
+
+      const flipOpenExtrusion =
+        isIsolatedOpen && dotVec(offset, faceNormal) < -1e-7;
+
+      if (isIsolatedOpen) {
+        if (!flipOpenExtrusion) {
+          reverseFaceWinding(face);
+        }
+      } else {
+        faceIdsToDelete.add(face.id);
+      }
+
+      const k = oldIds.length;
+      for (let i = 0; i < k; i++) {
+        const nextI = (i + 1) % k;
+        if (flipOpenExtrusion) {
+          mesh.addFace([oldIds[nextI], oldIds[i], newIds[i], newIds[nextI]]);
+        } else {
+          mesh.addFace([oldIds[i], oldIds[nextI], newIds[nextI], newIds[i]]);
+        }
+      }
+
+      const capVerts = flipOpenExtrusion ? [...newIds].reverse() : newIds;
+      const capFace = mesh.addFace(capVerts);
+      if (capFace) {
+        if (origUvs) {
+          capFace.uvs = flipOpenExtrusion ? [...origUvs].reverse() : origUvs;
+        }
+        nextSelected.add(capFace.id);
       }
     }
 
-    const isIsolatedOpen = boundaryEdgeCount > 0 && !hasUnselectedNeighbor;
-    const flipWinding = isIsolatedOpen && dotVec(avgOffset, avgNormal) < -1e-7;
+    if (faceIdsToDelete.size > 0) {
+      mesh.deleteFaces(faceIdsToDelete);
+    }
+    mesh.clearCustomNormals();
+    mesh.rebuildIndices();
+    return { mesh, nextSelectedIds: nextSelected };
+  }
 
+  // REGION EXTRUDE (Connected faces share new extruded vertices & keep only outer boundary walls)
+  const vertexNormalsAccum = new Map<string, Vec3>();
+  const vertexFallbackNormal = new Map<string, Vec3>();
+  const vertSet = new Set<string>();
+
+  for (const face of selectedFaces) {
+    const fn = mesh.computeFaceNormal(face);
+    for (const vid of face.vertexIds) {
+      vertSet.add(vid);
+      if (!vertexFallbackNormal.has(vid)) {
+        vertexFallbackNormal.set(vid, fn);
+      }
+      const prev = vertexNormalsAccum.get(vid) ?? [0, 0, 0];
+      vertexNormalsAccum.set(vid, addVec(prev, fn));
+    }
+  }
+
+  const vertMap = new Map<string, string>();
+  for (const vid of vertSet) {
+    const v = mesh.getVertex(vid);
+    if (!v) continue;
+    const fallback = vertexFallbackNormal.get(vid) ?? [0, 0, 1];
+    const dir =
+      axis === 'normal'
+        ? normVec(vertexNormalsAccum.get(vid) ?? fallback, fallback)
+        : axisVector(axis);
+    const pos = addVec(v.position, scaleVec(dir, distance));
+    const nv = mesh.addVertex(pos[0], pos[1], pos[2]);
+    vertMap.set(vid, nv.id);
+  }
+
+  // Compute signed alignment per-face for each island so symmetric curved open shells
+  // (e.g. open cylinder wall extruded inward) never suffer vector cancellation.
+  const faceToIsolatedInfo = new Map<
+    string,
+    { isIsolatedOpen: boolean; flipWinding: boolean }
+  >();
+
+  for (const compFaces of islandFacesList) {
+    const isIsolatedOpen = faceToIsIsolatedOpen.get(compFaces[0].id) ?? false;
+    let signedAlignmentSum = 0;
+
+    if (isIsolatedOpen) {
+      for (const f of compFaces) {
+        const fn = mesh.computeFaceNormal(f);
+        let faceDisp: Vec3 = [0, 0, 0];
+        let count = 0;
+        for (const vid of f.vertexIds) {
+          const v = mesh.getVertex(vid);
+          const nvId = vertMap.get(vid);
+          const nv = nvId ? mesh.getVertex(nvId) : undefined;
+          if (v && nv) {
+            faceDisp = addVec(faceDisp, subVec(nv.position, v.position));
+            count++;
+          }
+        }
+        if (count > 0) {
+          signedAlignmentSum += dotVec(faceDisp, fn) / count;
+        }
+      }
+    }
+
+    const flipWinding = isIsolatedOpen && signedAlignmentSum < -1e-7;
     for (const f of compFaces) {
       faceToIsolatedInfo.set(f.id, { isIsolatedOpen, flipWinding });
     }
   }
 
-  // Only delete original faces & internal edges for non-isolated islands
+  // Only delete original faces & shared internal edges for non-isolated islands
   const faceIdsToDelete = new Set<string>();
   const keptFaceIds = new Set<string>();
   const keptVertIds = new Set<string>();
+  const faceOriginalOrder = new Map<string, { verts: string[]; uvs?: Vec2[] }>();
 
   for (const face of selectedFaces) {
+    const origVerts = [...face.vertexIds];
+    const origUvs =
+      face.uvs && face.uvs.length === origVerts.length
+        ? face.uvs.map((uv) => [uv[0], uv[1]] as Vec2)
+        : undefined;
+    faceOriginalOrder.set(face.id, { verts: origVerts, uvs: origUvs });
+
     const info = faceToIsolatedInfo.get(face.id);
     if (info?.isIsolatedOpen) {
       keptFaceIds.add(face.id);
-      for (const vid of face.vertexIds) keptVertIds.add(vid);
+      for (const vid of origVerts) keptVertIds.add(vid);
       if (!info.flipWinding) {
         reverseFaceWinding(face);
       }
@@ -538,10 +584,11 @@ export function extrudeMesh(
   const internalEdgeIds = new Set<string>();
   for (const face of selectedFaces) {
     if (!faceIdsToDelete.has(face.id)) continue;
-    const n = face.vertexIds.length;
+    const orig = faceOriginalOrder.get(face.id)!.verts;
+    const n = orig.length;
     for (let i = 0; i < n; i++) {
-      const a = face.vertexIds[i];
-      const b = face.vertexIds[(i + 1) % n];
+      const a = orig[i];
+      const b = orig[(i + 1) % n];
       const eid = mesh.findEdgeId(a, b);
       if (!eid) continue;
       const allIncident = mesh.getFacesForEdge(eid);
@@ -554,17 +601,14 @@ export function extrudeMesh(
     }
   }
 
-  // Create boundary wall quads & collect new cap specs BEFORE deleting base faces
-  const newCapSpecs: string[][] = [];
+  // Create exterior boundary wall quads & collect displaced cap specs BEFORE deleting base faces
+  const newCapSpecs: { verts: string[]; uvs?: Vec2[] }[] = [];
   for (const face of selectedFaces) {
     const info = faceToIsolatedInfo.get(face.id);
     const isFlippedOpen = Boolean(info?.flipWinding);
-    const n = face.vertexIds.length;
-    // Note: if face was kept & reversed in-place above, iterate in original outward order for cap/walls
-    const origVerts =
-      info?.isIsolatedOpen && !info.flipWinding
-        ? [...face.vertexIds].reverse()
-        : face.vertexIds;
+    const orig = faceOriginalOrder.get(face.id)!;
+    const origVerts = orig.verts;
+    const n = origVerts.length;
 
     const mappedFaceVerts: string[] = [];
     for (let i = 0; i < n; i++) {
@@ -583,7 +627,15 @@ export function extrudeMesh(
         }
       }
     }
-    newCapSpecs.push(isFlippedOpen ? [...mappedFaceVerts].reverse() : mappedFaceVerts);
+
+    newCapSpecs.push({
+      verts: isFlippedOpen ? [...mappedFaceVerts].reverse() : mappedFaceVerts,
+      uvs: orig.uvs
+        ? isFlippedOpen
+          ? [...orig.uvs].reverse()
+          : orig.uvs
+        : undefined,
+    });
   }
 
   // Delete original faces belonging to non-isolated regions & their internal edges, add new caps
@@ -603,12 +655,18 @@ export function extrudeMesh(
     mesh.pruneOrphanVertices(pruneCandidates);
   }
 
-  for (const verts of newCapSpecs) {
-    const cap = mesh.addFace(verts);
-    if (cap) nextSelected.add(cap.id);
+  for (const spec of newCapSpecs) {
+    const cap = mesh.addFace(spec.verts);
+    if (cap) {
+      if (spec.uvs) {
+        cap.uvs = spec.uvs;
+      }
+      nextSelected.add(cap.id);
+    }
   }
 
   mesh.clearCustomNormals();
+  mesh.rebuildIndices();
   return { mesh, nextSelectedIds: nextSelected };
 }
 

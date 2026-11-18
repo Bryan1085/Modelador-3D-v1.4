@@ -1342,6 +1342,75 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               )}
 
+              <div className="h-px bg-[#2b2e36]" />
+
+              <div className="rounded-lg bg-[#15171c] border border-[#2b2e36] p-3 space-y-3">
+                <div className="text-xs font-semibold text-[#eceef2]">
+                  Guardado automático y recuperación
+                </div>
+
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-xs font-medium text-[#eceef2]">
+                      Guardado automático
+                    </div>
+                    <div className="text-[11px] text-[#8e95a2]">
+                      Guarda cambios y actualiza la miniatura automáticamente
+                    </div>
+                  </div>
+                  {renderSwitch(
+                    settings.autosaveEnabled,
+                    () =>
+                      onUpdateSettings({
+                        autosaveEnabled: !settings.autosaveEnabled,
+                      }),
+                    'Activar guardado automático',
+                  )}
+                </div>
+
+                {settings.autosaveEnabled && (
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-xs text-[#cbd5e1]">
+                      Intervalo de autoguardado
+                    </span>
+                    <select
+                      value={settings.autosaveIntervalSec}
+                      onChange={(e) =>
+                        onUpdateSettings({
+                          autosaveIntervalSec: Number(e.target.value),
+                        })
+                      }
+                      className="h-9 px-2.5 rounded-md bg-[#111317] border border-[#2f333d] text-xs font-mono-tabular text-[#f3f4f6] outline-none"
+                    >
+                      <option value={15}>Cada 15 s</option>
+                      <option value={30}>Cada 30 s</option>
+                      <option value={60}>Cada 1 min</option>
+                      <option value={120}>Cada 2 min</option>
+                      <option value={300}>Cada 5 min</option>
+                    </select>
+                  </div>
+                )}
+
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-xs font-medium text-[#eceef2]">
+                      Copia de seguridad previa
+                    </div>
+                    <div className="text-[11px] text-[#8e95a2]">
+                      Conserva un respaldo antes de cada sobrescritura manual
+                    </div>
+                  </div>
+                  {renderSwitch(
+                    settings.createRecoveryBackups,
+                    () =>
+                      onUpdateSettings({
+                        createRecoveryBackups: !settings.createRecoveryBackups,
+                      }),
+                    'Copia de seguridad previa',
+                  )}
+                </div>
+              </div>
+
               {sceneStats && (
                 <div className="rounded-lg bg-[#15171c] border border-[#2b2e36] p-3 space-y-2">
                   <div className="flex items-center justify-between text-xs">

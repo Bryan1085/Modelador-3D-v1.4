@@ -110,6 +110,25 @@ export interface SceneData {
   objects: SceneObjectData[];
 }
 
+export type ProjectTemplateId = 'empty' | 'cube' | 'uv_sphere' | 'plane';
+
+export type SaveStatus = 'saved' | 'saving' | 'unsaved' | 'error';
+
+export type ProjectSortBy =
+  | 'updated_desc'
+  | 'created_desc'
+  | 'name_asc'
+  | 'updated_asc';
+
+export type GalleryViewMode = 'grid' | 'list';
+
+export interface ProjectFolder {
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface ProjectData {
   version: number;
   coordinateSystem?: 'z-up' | 'y-up';
@@ -117,6 +136,11 @@ export interface ProjectData {
   name: string;
   createdAt: number;
   updatedAt: number;
+  lastOpenedAt?: number;
+  folderId?: string | null;
+  templateId?: ProjectTemplateId;
+  thumbnailDataUrl?: string | null;
+  thumbnailUpdatedAt?: number;
   activeSceneId: string;
   scenes: SceneData[];
 }
@@ -124,8 +148,68 @@ export interface ProjectData {
 export interface ProjectSummary {
   id: string;
   name: string;
+  createdAt: number;
   updatedAt: number;
+  lastOpenedAt?: number;
   objectCount: number;
+  folderId: string | null;
+  thumbnailDataUrl?: string | null;
+  hasRecoveryDraft?: boolean;
+}
+
+export interface ProjectRecoveryRecord {
+  projectId: string;
+  savedAt: number;
+  reason: 'autosave' | 'backup';
+  project: ProjectData;
+  thumbnailDataUrl?: string | null;
+}
+
+export interface NativeProjectFileEnvelope {
+  format: 'forma3d-project';
+  formatVersion: 1;
+  exportedAt: number;
+  folderName?: string | null;
+  thumbnailDataUrl?: string | null;
+  project: ProjectData;
+}
+
+export interface SaveOperationResult {
+  ok: boolean;
+  project?: ProjectData;
+  error?: string;
+  quotaExceeded?: boolean;
+}
+
+export type DeleteFolderResolution =
+  | { mode: 'unfile' }
+  | { mode: 'move'; targetFolderId: string };
+
+export interface ProjectStorageAdapter {
+  listProjects(): Promise<ProjectSummary[]>;
+  saveProject(
+    project: ProjectData,
+    options?: {
+      thumbnailDataUrl?: string | null;
+      createBackup?: boolean;
+    },
+  ): Promise<SaveOperationResult>;
+  loadProject(projectId: string): Promise<ProjectData | null>;
+  loadBackupProject(projectId: string): Promise<ProjectData | null>;
+  deleteProjects(projectIds: string[]): Promise<{ ok: boolean; error?: string }>;
+  listFolders(): Promise<ProjectFolder[]>;
+  saveFolder(folder: ProjectFolder): Promise<{ ok: boolean; error?: string }>;
+  deleteFolder(
+    folderId: string,
+    resolution: DeleteFolderResolution,
+  ): Promise<{ ok: boolean; error?: string }>;
+  saveRecoveryDraft(
+    project: ProjectData,
+    thumbnailDataUrl?: string | null,
+  ): Promise<void>;
+  loadRecoveryDraft(projectId: string): Promise<ProjectRecoveryRecord | null>;
+  clearRecoveryDraft(projectId: string): Promise<void>;
+  listRecoveryProjectIds(): Promise<string[]>;
 }
 
 export type FloatingMenuCorner =
@@ -230,7 +314,11 @@ export interface ModelerSettings {
   snapRotateDeg: number;
   snapScaleStep: number;
   multiSelectTouch: boolean;
+  autosaveEnabled: boolean;
+  autosaveIntervalSec: number;
+  createRecoveryBackups: boolean;
   proportionalEditing: ProportionalEditingSettings;
   touch: TouchControlSettings;
   toolConfigs: ToolConfigurations;
 }
+

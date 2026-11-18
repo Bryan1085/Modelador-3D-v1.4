@@ -1,11 +1,13 @@
 import * as THREE from 'three';
-import { createCubeMesh } from '../mesh/primitives';
+import { createCubeMesh, createPrimitiveMesh, PRIMITIVE_LABELS } from '../mesh/primitives';
 import { normalizeModifierSlot } from '../modifiers/types';
+import { generateTemplateThumbnailDataUrl } from './thumbnail';
 import {
   CollectionData,
   ModifierSlot,
   ObjectTransform,
   ProjectData,
+  ProjectTemplateId,
   ReferenceImageData,
   ReferenceImageDepthMode,
   ReferenceImageOrientation,
@@ -230,6 +232,93 @@ export function createDefaultScene(
   };
 }
 
+export function createProjectFromTemplate(params: {
+  name?: string;
+  templateId: ProjectTemplateId;
+  folderId?: string | null;
+}): ProjectData {
+  const now = Date.now();
+  const baseScene = createDefaultScene('Scene', false);
+  const collectionId = baseScene.activeCollectionId;
+  const objects: SceneObjectData[] = [];
+
+  if (params.templateId !== 'empty') {
+    const primitiveType = params.templateId;
+    const mesh =
+      primitiveType === 'uv_sphere'
+        ? createPrimitiveMesh('uv_sphere', { radius: 1, segments: 20, rings: 14 })
+        : primitiveType === 'plane'
+          ? createPrimitiveMesh('plane', { size: 2.5 })
+          : createPrimitiveMesh('cube', { size: 2 });
+
+    objects.push({
+      id: createHierarchyId('obj'),
+      name: PRIMITIVE_LABELS[primitiveType],
+      objectType: 'mesh',
+      primitiveType,
+      collectionId,
+      visible: true,
+      locked: false,
+      transform: {
+        position: [0, 0, 0],
+        rotation: [0, 0, 0],
+        scale: [1, 1, 1],
+      },
+      mesh: mesh.toJSON(),
+      material: {
+        color: '#9aa0a6',
+        roughness: 0.55,
+        metalness: 0.08,
+      },
+      modifiers: [],
+    });
+  }
+
+  const scene: SceneData = {
+    ...baseScene,
+    objects,
+  };
+
+  return {
+    version: 2,
+    coordinateSystem: 'z-up',
+    id: createHierarchyId('proj'),
+    name: params.name?.trim() || 'Nuevo Proyecto',
+    createdAt: now,
+    updatedAt: now,
+    lastOpenedAt: now,
+    folderId: params.folderId ?? null,
+    templateId: params.templateId,
+    thumbnailDataUrl: generateTemplateThumbnailDataUrl(params.templateId),
+    thumbnailUpdatedAt: now,
+    activeSceneId: scene.id,
+    scenes: [scene],
+  };
+}
+
+export function cloneProjectForDuplicate(
+  source: ProjectData,
+  newName?: string,
+  targetFolderId?: string | null,
+): ProjectData {
+  const now = Date.now();
+  const deepCopy = JSON.parse(JSON.stringify(source)) as ProjectData;
+  return {
+    ...deepCopy,
+    version: 2,
+    coordinateSystem: 'z-up',
+    id: createHierarchyId('proj'),
+    name: newName?.trim() || `${source.name} (copia)`,
+    createdAt: now,
+    updatedAt: now,
+    lastOpenedAt: undefined,
+    folderId:
+      targetFolderId !== undefined ? targetFolderId : (source.folderId ?? null),
+    thumbnailDataUrl: source.thumbnailDataUrl ?? null,
+    thumbnailUpdatedAt: source.thumbnailUpdatedAt ?? now,
+  };
+}
+
 /**
  * Ensures any loaded or legacy v1 project satisfies all hierarchy invariants:
  * - At least one Scene (default "Scene")
@@ -430,6 +519,31 @@ export function normalizeProjectHierarchy(raw: unknown): ProjectData | null {
       ? candidate.activeSceneId
       : normalizedScenes[0].id;
 
+  const lastOpenedAt =
+    typeof candidate.lastOpenedAt === 'number'
+      ? candidate.lastOpenedAt
+      : undefined;
+  const folderId =
+    typeof candidate.folderId === 'string' && candidate.folderId.trim()
+      ? candidate.folderId
+      : null;
+  const templateId =
+    candidate.templateId === 'empty' ||
+    candidate.templateId === 'cube' ||
+    candidate.templateId === 'uv_sphere' ||
+    candidate.templateId === 'plane'
+      ? candidate.templateId
+      : undefined;
+  const thumbnailDataUrl =
+    typeof candidate.thumbnailDataUrl === 'string' &&
+    candidate.thumbnailDataUrl.startsWith('data:image/')
+      ? candidate.thumbnailDataUrl
+      : null;
+  const thumbnailUpdatedAt =
+    typeof candidate.thumbnailUpdatedAt === 'number'
+      ? candidate.thumbnailUpdatedAt
+      : undefined;
+
   return {
     version: 2,
     coordinateSystem: 'z-up',
@@ -437,6 +551,11 @@ export function normalizeProjectHierarchy(raw: unknown): ProjectData | null {
     name: baseName,
     createdAt,
     updatedAt,
+    ...(lastOpenedAt !== undefined ? { lastOpenedAt } : {}),
+    folderId,
+    ...(templateId ? { templateId } : {}),
+    ...(thumbnailDataUrl ? { thumbnailDataUrl } : {}),
+    ...(thumbnailUpdatedAt !== undefined ? { thumbnailUpdatedAt } : {}),
     activeSceneId,
     scenes: normalizedScenes,
   };

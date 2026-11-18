@@ -25,21 +25,35 @@ import {
   RadialWorkMode,
 } from '../core/radial/radialActions';
 import {
+  clearRecoveryDraftAsync,
   createDefaultToolConfigs,
   createNewProject,
   createDefaultTouchSettings,
+  createProjectFolderAsync,
   DEFAULT_MODELER_SETTINGS,
+  deleteProjectFolderAsync,
   deleteProjectLocally,
+  deleteProjectsAsync,
+  duplicateSavedProjectAsync,
   generateId,
   getActiveStoredProjectId,
+  listProjectFoldersAsync,
+  listRecoveryProjectIdsAsync,
   listSavedProjects,
+  listSavedProjectsAsync,
   loadInitialProject,
   loadLastGizmoMode,
   loadProjectFromAnyStorage,
   loadProjectLocally,
+  loadRecoveryDraftAsync,
   loadSettingsLocally,
+  moveProjectsToFolderAsync,
+  renameProjectFolderAsync,
+  renameSavedProjectAsync,
   saveLastGizmoMode,
+  saveProjectAsync,
   saveProjectLocally,
+  saveRecoveryDraftAsync,
   saveSettingsLocally,
 } from '../core/project/storage';
 import {
@@ -88,6 +102,8 @@ import {
   normalizeProportionalSettings,
 } from '../core/mesh/proportionalEditing';
 import {
+  cloneProjectForDuplicate,
+  createProjectFromTemplate,
   addCollectionToScene,
   addSceneToProject,
   createReferenceImageObject,
@@ -106,6 +122,11 @@ import {
   toggleCollectionExpandedInScene,
   updateActiveScene,
 } from '../core/project/hierarchy';
+import {
+  buildSafeProjectFilename,
+  parseNativeProjectFile,
+  serializeNativeProjectFile,
+} from '../core/project/projectFileFormat';
 import { ObjImportResult } from '../core/io/objImport';
 import { StlImportResult } from '../core/io/stlImport';
 import { LoadedImageReferencePayload } from '../core/io/imageReference';
@@ -113,14 +134,19 @@ import {
   AxisConstraint,
   CameraProjection,
   ConfigurableToolKey,
+  DeleteFolderResolution,
   GizmoTransformMode,
   ModelerSettings,
   MoveSubMode,
   ObjectTransform,
   ProjectData,
+  ProjectFolder,
+  ProjectRecoveryRecord,
   ProjectSummary,
+  ProjectTemplateId,
   ReferenceImageData,
   ReferenceImageOrientation,
+  SaveStatus,
   SceneData,
   SceneObjectData,
   ToolConfigurations,
@@ -252,7 +278,24 @@ export function useModelerStore() {
   const [savedProjects, setSavedProjects] = useState<ProjectSummary[]>(() =>
     listSavedProjects(),
   );
+  const [folders, setFolders] = useState<ProjectFolder[]>([]);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>('saved');
+  const [lastSavedAt, setLastSavedAt] = useState<number | null>(
+    () => initialProject.updatedAt ?? null,
+  );
+  const [lastSaveError, setLastSaveError] = useState<string | null>(null);
+  const [pendingRecovery, setPendingRecovery] =
+    useState<ProjectRecoveryRecord | null>(null);
+  const [startupRecoveryList, setStartupRecoveryList] = useState<
+    ProjectRecoveryRecord[]
+  >([]);
+  const [isGalleryReady, setIsGalleryReady] = useState(false);
+
+  const thumbnailProviderRef = useRef<(() => string | null) | null>(null);
+  const isModelerActiveRef = useRef(false);
+  const isSavingRef = useRef(false);
+  const lastAutosaveRevisionRef = useRef(-1);
 
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(
     () => getActiveScene(initialProject).objects[0]?.id ?? null,
@@ -404,26 +447,61 @@ export function useModelerStore() {
     }, 2600);
   }, []);
 
-  // Hydrate active project from IndexedDB if it holds a newer/larger copy (e.g. embedded reference images)
+  const registerThumbnailProvider = useCallback(
+    (provider: (() => string | null) | null) => {
+      thumbnailProviderRef.current = provider;
+    },
+    [],
+  );
+
+  const setModelerActive = useCallback((active: boolean) => {
+    isModelerActiveRef.current = active;
+  }, []);
+
+  const refreshGalleryData = useCallback(async () => {
+    const [nextProjects, nextFolders] = await Promise.all([
+      listSavedProjectsAsync(),
+      listProjectFoldersAsync(),
+    ]);
+    setSavedProjects(nextProjects);
+    setFolders(nextFolders);
+  }, []);
+
+  // Hydrate persistent gallery index, folders, active project, and any crash recovery drafts on startup
   const initialHydrateRef = useRef(false);
   useEffect(() => {
     if (initialHydrateRef.current) return;
     initialHydrateRef.current = true;
-    const storedId = getActiveStoredProjectId() ?? initialProject.id;
-    void loadProjectFromAnyStorage(storedId).then((idbProj) => {
-      if (!idbProj) return;
-      setProject((curr) => {
-        if (curr.id === idbProj.id && idbProj.updatedAt <= curr.updatedAt) {
-          return curr;
+    void (async () => {
+      await refreshGalleryData();
+      const recIds = await listRecoveryProjectIdsAsync();
+      if (recIds.length > 0) {
+        const loadedRecs: ProjectRecoveryRecord[] = [];
+        for (const id of recIds) {
+          const rec = await loadRecoveryDraftAsync(id);
+          if (rec) loadedRecs.push(rec);
         }
-        const firstId = getActiveScene(idbProj).objects[0]?.id ?? null;
-        setSelectedObjectId(firstId);
-        setSelectedObjectIds(firstId ? new Set([firstId]) : new Set());
-        setMeshRevision((r) => r + 1);
-        return idbProj;
-      });
-    });
-  }, [initialProject.id]);
+        loadedRecs.sort((a, b) => b.savedAt - a.savedAt);
+        setStartupRecoveryList(loadedRecs);
+      }
+
+      const storedId = getActiveStoredProjectId() ?? initialProject.id;
+      const idbProj = await loadProjectFromAnyStorage(storedId);
+      if (idbProj) {
+        setProject((curr) => {
+          if (curr.id === idbProj.id && idbProj.updatedAt <= curr.updatedAt) {
+            return curr;
+          }
+          const firstId = getActiveScene(idbProj).objects[0]?.id ?? null;
+          setSelectedObjectId(firstId);
+          setSelectedObjectIds(firstId ? new Set([firstId]) : new Set());
+          setMeshRevision((r) => r + 1);
+          return idbProj;
+        });
+      }
+      setIsGalleryReady(true);
+    })();
+  }, [initialProject.id, refreshGalleryData]);
 
   const activeScene = useMemo(() => getActiveScene(project), [project]);
   const activeObjects = activeScene.objects;
@@ -559,65 +637,201 @@ export function useModelerStore() {
     setHasUnsavedChanges(true);
   }, []);
 
-  const saveProject = useCallback(() => {
-    const saved = saveProjectLocally(project);
-    setProject(saved);
-    setSavedProjects(listSavedProjects());
-    setHasUnsavedChanges(false);
-    showToast(`Proyecto "${saved.name}" guardado`);
-  }, [project, showToast]);
+  const performPersistProject = useCallback(
+    async (
+      targetProject: ProjectData,
+      options?: {
+        explicitThumbnail?: string | null;
+        silent?: boolean;
+        captureViewport?: boolean;
+      },
+    ): Promise<boolean> => {
+      if (isSavingRef.current) return false;
+      isSavingRef.current = true;
+      setSaveStatus('saving');
 
-  const saveProjectAs = useCallback(
-    (newName: string) => {
-      const trimmed = newName.trim() || `${project.name} (copia)`;
-      const now = Date.now();
-      const cloned: ProjectData = {
-        ...JSON.parse(JSON.stringify(project)),
-        id: generateId('proj'),
-        name: trimmed,
-        createdAt: now,
-        updatedAt: now,
-      };
-      const saved = saveProjectLocally(cloned);
-      setProject(saved);
-      setSavedProjects(listSavedProjects());
-      setHasUnsavedChanges(false);
-      showToast(`Proyecto guardado como "${saved.name}"`);
+      try {
+        let thumbnail = options?.explicitThumbnail;
+        if (
+          thumbnail === undefined &&
+          options?.captureViewport !== false &&
+          isModelerActiveRef.current &&
+          thumbnailProviderRef.current
+        ) {
+          thumbnail = thumbnailProviderRef.current() ?? undefined;
+        }
+
+        const res = await saveProjectAsync(targetProject, {
+          thumbnailDataUrl: thumbnail,
+          createBackup: settings.createRecoveryBackups,
+        });
+
+        if (!res.ok || !res.project) {
+          const msg =
+            res.error ?? 'No se pudo guardar el proyecto en el dispositivo.';
+          setSaveStatus('error');
+          setLastSaveError(msg);
+          showToast(msg);
+          return false;
+        }
+
+        await clearRecoveryDraftAsync(res.project.id);
+        setStartupRecoveryList((prev) =>
+          prev.filter((r) => r.projectId !== res.project!.id),
+        );
+
+        setProject((curr) =>
+          curr.id === res.project!.id
+            ? {
+                ...curr,
+                updatedAt: res.project!.updatedAt,
+                thumbnailDataUrl: res.project!.thumbnailDataUrl,
+                thumbnailUpdatedAt: res.project!.thumbnailUpdatedAt,
+              }
+            : curr,
+        );
+        await refreshGalleryData();
+        setHasUnsavedChanges(false);
+        setSaveStatus('saved');
+        setLastSavedAt(res.project.updatedAt);
+        setLastSaveError(null);
+        lastAutosaveRevisionRef.current = meshRevision;
+        if (!options?.silent) {
+          showToast(`Proyecto "${res.project.name}" guardado`);
+        }
+        return true;
+      } catch (err) {
+        const msg =
+          err instanceof Error ? err.message : 'Error inesperado al guardar.';
+        setSaveStatus('error');
+        setLastSaveError(msg);
+        showToast(msg);
+        return false;
+      } finally {
+        isSavingRef.current = false;
+      }
     },
-    [project, showToast],
+    [meshRevision, refreshGalleryData, settings.createRecoveryBackups, showToast],
   );
 
-  const createProject = useCallback(
-    (name: string) => {
-      setOperatorSession(null);
-      const fresh = saveProjectLocally(createNewProject(name.trim() || 'Nuevo Proyecto'));
-      undoStackRef.current = [];
-      redoStackRef.current = [];
-      savedEditSelectionsRef.current.clear();
-      setProject(fresh);
-      setSavedProjects(listSavedProjects());
-      setSingleSelectedObject(getActiveScene(fresh).objects[0]?.id ?? null);
-      setWorkMode('object');
-      releaseScreenModifiers();
-      setSelectedComponentIds(new Set());
-      setHasUnsavedChanges(false);
-      setMeshRevision((r) => r + 1);
-      setHistoryVersion((v) => v + 1);
-      showToast(`Proyecto "${fresh.name}" creado`);
-    },
-    [releaseScreenModifiers, setSingleSelectedObject, showToast],
-  );
+  // Reflect pending edits in live SaveStatus
+  useEffect(() => {
+    if (hasUnsavedChanges) {
+      setSaveStatus((prev) => (prev === 'saving' ? prev : 'unsaved'));
+    }
+  }, [hasUnsavedChanges]);
 
-  const openProject = useCallback(
-    async (projectId: string) => {
-      const loaded =
-        (await loadProjectFromAnyStorage(projectId)) ??
-        loadProjectLocally(projectId);
-      if (!loaded) {
-        showToast('No se pudo cargar el proyecto');
+  // Write lightweight recovery snapshot quickly after meaningful edits
+  useEffect(() => {
+    if (!hasUnsavedChanges || !isModelerActiveRef.current) return;
+    const snapProj = project;
+    const timer = window.setTimeout(() => {
+      if (!isModelerActiveRef.current) return;
+      const thumb = thumbnailProviderRef.current?.() ?? undefined;
+      void saveRecoveryDraftAsync(snapProj, thumb);
+    }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [hasUnsavedChanges, meshRevision, project]);
+
+  // Post-major-operation debounced autosave
+  useEffect(() => {
+    if (
+      !settings.autosaveEnabled ||
+      !hasUnsavedChanges ||
+      !isModelerActiveRef.current
+    ) {
+      return;
+    }
+    if (lastAutosaveRevisionRef.current === meshRevision) return;
+    const snapProj = project;
+    const timer = window.setTimeout(() => {
+      if (!isModelerActiveRef.current || isSavingRef.current) return;
+      void performPersistProject(snapProj, { silent: true });
+    }, 3200);
+    return () => window.clearTimeout(timer);
+  }, [
+    hasUnsavedChanges,
+    meshRevision,
+    performPersistProject,
+    project,
+    settings.autosaveEnabled,
+  ]);
+
+  // Periodic interval autosave
+  useEffect(() => {
+    if (!settings.autosaveEnabled) return;
+    const intervalMs = Math.max(10, settings.autosaveIntervalSec) * 1000;
+    const id = window.setInterval(() => {
+      if (!isModelerActiveRef.current || !hasUnsavedChanges || isSavingRef.current) {
         return;
       }
+      void performPersistProject(project, { silent: true });
+    }, intervalMs);
+    return () => window.clearInterval(id);
+  }, [
+    hasUnsavedChanges,
+    performPersistProject,
+    project,
+    settings.autosaveEnabled,
+    settings.autosaveIntervalSec,
+  ]);
+
+  const saveProject = useCallback(
+    async (explicitThumbnail?: string | null): Promise<boolean> => {
+      return performPersistProject(project, {
+        explicitThumbnail,
+        silent: false,
+      });
+    },
+    [performPersistProject, project],
+  );
+
+  const saveProjectSilent = useCallback(
+    async (explicitThumbnail?: string | null): Promise<boolean> => {
+      return performPersistProject(project, {
+        explicitThumbnail,
+        silent: true,
+      });
+    },
+    [performPersistProject, project],
+  );
+
+  const saveProjectAs = useCallback(
+    async (newName: string): Promise<boolean> => {
+      const trimmed = newName.trim() || `${project.name} (copia)`;
+      const cloned = cloneProjectForDuplicate(project, trimmed);
+      const capturedThumb = isModelerActiveRef.current
+        ? thumbnailProviderRef.current?.() ?? cloned.thumbnailDataUrl ?? null
+        : cloned.thumbnailDataUrl ?? null;
+
+      const res = await saveProjectAsync(cloned, {
+        thumbnailDataUrl: capturedThumb,
+        createBackup: false,
+      });
+      if (!res.ok || !res.project) {
+        const msg = res.error ?? 'No se pudo guardar la copia del proyecto.';
+        setSaveStatus('error');
+        setLastSaveError(msg);
+        showToast(msg);
+        return false;
+      }
+      setProject(res.project);
+      await refreshGalleryData();
+      setHasUnsavedChanges(false);
+      setSaveStatus('saved');
+      setLastSavedAt(res.project.updatedAt);
+      setLastSaveError(null);
+      showToast(`Proyecto guardado como "${res.project.name}"`);
+      return true;
+    },
+    [project, refreshGalleryData, showToast],
+  );
+
+  const hydrateProjectIntoEditor = useCallback(
+    (loaded: ProjectData) => {
       setOperatorSession(null);
+      setModalTransform(null);
+      setModalCancelNonce((n) => n + 1);
       undoStackRef.current = [];
       redoStackRef.current = [];
       savedEditSelectionsRef.current.clear();
@@ -627,19 +841,322 @@ export function useModelerStore() {
       releaseScreenModifiers();
       setSelectedComponentIds(new Set());
       setHasUnsavedChanges(false);
+      setSaveStatus('saved');
+      setLastSavedAt(loaded.updatedAt);
+      setLastSaveError(null);
       setMeshRevision((r) => r + 1);
       setHistoryVersion((v) => v + 1);
-      showToast(`Proyecto "${loaded.name}" abierto`);
+      lastAutosaveRevisionRef.current = -1;
     },
-    [releaseScreenModifiers, setSingleSelectedObject, showToast],
+    [releaseScreenModifiers, setSingleSelectedObject],
+  );
+
+  const createProject = useCallback(
+    async (
+      name: string,
+      templateId: ProjectTemplateId = 'cube',
+      folderId: string | null = null,
+    ): Promise<ProjectData | null> => {
+      const fresh = createProjectFromTemplate({
+        name: name.trim() || 'Nuevo Proyecto',
+        templateId,
+        folderId,
+      });
+      const res = await saveProjectAsync(fresh, {
+        thumbnailDataUrl: fresh.thumbnailDataUrl ?? null,
+        createBackup: false,
+      });
+      const saved = res.project ?? fresh;
+      if (!res.ok) {
+        showToast(res.error ?? 'Error al guardar el nuevo proyecto');
+        return null;
+      }
+      hydrateProjectIntoEditor(saved);
+      await refreshGalleryData();
+      showToast(`Proyecto "${saved.name}" creado`);
+      return saved;
+    },
+    [hydrateProjectIntoEditor, refreshGalleryData, showToast],
+  );
+
+  const openProject = useCallback(
+    async (
+      projectId: string,
+      options?: { skipRecoveryCheck?: boolean },
+    ): Promise<boolean> => {
+      const loaded =
+        (await loadProjectFromAnyStorage(projectId)) ??
+        loadProjectLocally(projectId);
+      if (!loaded) {
+        showToast('No se pudo cargar el proyecto');
+        return false;
+      }
+
+      if (!options?.skipRecoveryCheck) {
+        const rec = await loadRecoveryDraftAsync(projectId);
+        if (rec && rec.savedAt > loaded.updatedAt) {
+          setPendingRecovery(rec);
+          return false;
+        }
+      }
+
+      const withOpenedAt: ProjectData = {
+        ...loaded,
+        lastOpenedAt: Date.now(),
+      };
+      hydrateProjectIntoEditor(withOpenedAt);
+      // Persist updated lastOpenedAt cleanly in background
+      void saveProjectAsync(withOpenedAt, { createBackup: false }).then(() =>
+        refreshGalleryData(),
+      );
+      showToast(`Proyecto "${loaded.name}" abierto`);
+      return true;
+    },
+    [hydrateProjectIntoEditor, refreshGalleryData, showToast],
+  );
+
+  const applyRecoveryDraft = useCallback(
+    async (record: ProjectRecoveryRecord): Promise<void> => {
+      const recovered: ProjectData = {
+        ...record.project,
+        lastOpenedAt: Date.now(),
+        ...(record.thumbnailDataUrl
+          ? { thumbnailDataUrl: record.thumbnailDataUrl }
+          : {}),
+      };
+      hydrateProjectIntoEditor(recovered);
+      setHasUnsavedChanges(true);
+      setSaveStatus('unsaved');
+      setPendingRecovery(null);
+      showToast(`Borrador recuperado para "${recovered.name}"`);
+    },
+    [hydrateProjectIntoEditor, showToast],
+  );
+
+  const discardRecoveryDraft = useCallback(
+    async (projectId: string): Promise<void> => {
+      await clearRecoveryDraftAsync(projectId);
+      setStartupRecoveryList((prev) =>
+        prev.filter((r) => r.projectId !== projectId),
+      );
+      setPendingRecovery((curr) =>
+        curr?.projectId === projectId ? null : curr,
+      );
+      await refreshGalleryData();
+    },
+    [refreshGalleryData],
+  );
+
+  const dismissPendingRecovery = useCallback(() => {
+    setPendingRecovery(null);
+  }, []);
+
+  const renameProjectById = useCallback(
+    async (projectId: string, newName: string): Promise<boolean> => {
+      const res = await renameSavedProjectAsync(projectId, newName);
+      if (!res.ok || !res.project) {
+        showToast(res.error ?? 'No se pudo renombrar el proyecto');
+        return false;
+      }
+      if (project.id === projectId) {
+        setProject((p) => ({ ...p, name: res.project!.name }));
+      }
+      await refreshGalleryData();
+      showToast(`Proyecto renombrado a "${res.project.name}"`);
+      return true;
+    },
+    [project.id, refreshGalleryData, showToast],
+  );
+
+  const duplicateProjectById = useCallback(
+    async (projectId: string, newName?: string): Promise<ProjectData | null> => {
+      const res = await duplicateSavedProjectAsync(projectId, newName);
+      if (!res.ok || !res.project) {
+        showToast(res.error ?? 'No se pudo duplicar el proyecto');
+        return null;
+      }
+      await refreshGalleryData();
+      showToast(`Copia "${res.project.name}" creada`);
+      return res.project;
+    },
+    [refreshGalleryData, showToast],
   );
 
   const removeSavedProject = useCallback(
-    (projectId: string) => {
+    async (projectId: string) => {
       deleteProjectLocally(projectId);
-      setSavedProjects(listSavedProjects());
+      await deleteProjectsAsync([projectId]);
+      await refreshGalleryData();
     },
-    [],
+    [refreshGalleryData],
+  );
+
+  const deleteProjectsByIds = useCallback(
+    async (projectIds: string[]): Promise<boolean> => {
+      if (projectIds.length === 0) return true;
+      const res = await deleteProjectsAsync(projectIds);
+      if (!res.ok) {
+        showToast(res.error ?? 'No se pudieron eliminar los proyectos');
+        return false;
+      }
+      await refreshGalleryData();
+      showToast(
+        projectIds.length === 1
+          ? 'Proyecto eliminado'
+          : `${projectIds.length} proyectos eliminados`,
+      );
+      return true;
+    },
+    [refreshGalleryData, showToast],
+  );
+
+  const moveProjectsToFolder = useCallback(
+    async (projectIds: string[], folderId: string | null): Promise<boolean> => {
+      if (projectIds.length === 0) return true;
+      const res = await moveProjectsToFolderAsync(projectIds, folderId);
+      if (!res.ok) {
+        showToast(res.error ?? 'No se pudieron mover los proyectos');
+        return false;
+      }
+      if (projectIds.includes(project.id)) {
+        setProject((p) => ({ ...p, folderId }));
+      }
+      await refreshGalleryData();
+      showToast(
+        folderId
+          ? 'Proyecto(s) movido(s) a carpeta'
+          : 'Proyecto(s) movido(s) a Sin carpeta',
+      );
+      return true;
+    },
+    [project.id, refreshGalleryData, showToast],
+  );
+
+  const createFolder = useCallback(
+    async (name: string): Promise<ProjectFolder | null> => {
+      const res = await createProjectFolderAsync(name);
+      if (!res.ok || !res.folder) {
+        showToast(res.error ?? 'No se pudo crear la carpeta');
+        return null;
+      }
+      await refreshGalleryData();
+      showToast(`Carpeta "${res.folder.name}" creada`);
+      return res.folder;
+    },
+    [refreshGalleryData, showToast],
+  );
+
+  const renameFolder = useCallback(
+    async (folderId: string, newName: string): Promise<boolean> => {
+      const res = await renameProjectFolderAsync(folderId, newName);
+      if (!res.ok) {
+        showToast(res.error ?? 'No se pudo renombrar la carpeta');
+        return false;
+      }
+      await refreshGalleryData();
+      showToast('Carpeta renombrada');
+      return true;
+    },
+    [refreshGalleryData, showToast],
+  );
+
+  const deleteFolder = useCallback(
+    async (
+      folderId: string,
+      resolution: DeleteFolderResolution = { mode: 'unfile' },
+    ): Promise<boolean> => {
+      const res = await deleteProjectFolderAsync(folderId, resolution);
+      if (!res.ok) {
+        showToast(res.error ?? 'No se pudo eliminar la carpeta');
+        return false;
+      }
+      if (project.folderId === folderId) {
+        setProject((p) => ({
+          ...p,
+          folderId:
+            resolution.mode === 'move' ? resolution.targetFolderId : null,
+        }));
+      }
+      await refreshGalleryData();
+      showToast('Carpeta eliminada (proyectos conservados)');
+      return true;
+    },
+    [project.folderId, refreshGalleryData, showToast],
+  );
+
+  const exportNativeProject = useCallback(
+    async (
+      targetProjectId?: string,
+    ): Promise<{ filename: string; content: string; project: ProjectData } | null> => {
+      const source =
+        !targetProjectId || targetProjectId === project.id
+          ? project
+          : await loadProjectFromAnyStorage(targetProjectId);
+      if (!source) {
+        showToast('No se encontró el proyecto para exportar');
+        return null;
+      }
+      const thumb =
+        source.id === project.id && isModelerActiveRef.current
+          ? thumbnailProviderRef.current?.() ?? source.thumbnailDataUrl ?? null
+          : source.thumbnailDataUrl ?? null;
+      const folderName = source.folderId
+        ? folders.find((f) => f.id === source.folderId)?.name ?? null
+        : null;
+      const content = serializeNativeProjectFile(source, {
+        folderName,
+        thumbnailDataUrl: thumb,
+      });
+      return {
+        filename: buildSafeProjectFilename(source.name),
+        content,
+        project: source,
+      };
+    },
+    [folders, project, showToast],
+  );
+
+  const importNativeProject = useCallback(
+    async (
+      rawText: string,
+      targetFolderId: string | null = null,
+    ): Promise<{ ok: boolean; project?: ProjectData; error?: string }> => {
+      const parsed = parseNativeProjectFile(rawText);
+      if (!parsed.ok) {
+        return { ok: false, error: parsed.error };
+      }
+
+      const incoming = parsed.envelope.project;
+      const existingList = await listSavedProjectsAsync();
+      const idExists = existingList.some((s) => s.id === incoming.id);
+      const now = Date.now();
+      const readyProject: ProjectData = {
+        ...incoming,
+        id: idExists ? generateId('proj') : incoming.id,
+        name: idExists ? `${incoming.name} (importado)` : incoming.name,
+        folderId: targetFolderId ?? incoming.folderId ?? null,
+        createdAt: incoming.createdAt || now,
+        updatedAt: now,
+      };
+
+      const res = await saveProjectAsync(readyProject, {
+        thumbnailDataUrl:
+          parsed.envelope.thumbnailDataUrl ??
+          readyProject.thumbnailDataUrl ??
+          null,
+        createBackup: false,
+      });
+      if (!res.ok || !res.project) {
+        return {
+          ok: false,
+          error: res.error ?? 'No se pudo guardar el proyecto importado.',
+        };
+      }
+      await refreshGalleryData();
+      showToast(`Proyecto "${res.project.name}" importado`);
+      return { ok: true, project: res.project };
+    },
+    [refreshGalleryData, showToast],
   );
 
   const addPrimitive = useCallback(
@@ -4173,7 +4690,14 @@ export function useModelerStore() {
     activeCollectionId: activeScene.activeCollectionId,
     renderedObjects,
     savedProjects,
+    folders,
     hasUnsavedChanges,
+    saveStatus,
+    lastSavedAt,
+    lastSaveError,
+    pendingRecovery,
+    startupRecoveryList,
+    isGalleryReady,
     selectedObject: renderedSelectedObject,
     selectedObjectId,
     selectedObjectIds,
@@ -4218,12 +4742,28 @@ export function useModelerStore() {
     setProjection,
     setCameraRotationLocked,
     toggleCameraRotationLock,
+    registerThumbnailProvider,
+    setModelerActive,
+    refreshGalleryData,
     setProjectName,
     saveProject,
+    saveProjectSilent,
     saveProjectAs,
     createProject,
     openProject,
+    applyRecoveryDraft,
+    discardRecoveryDraft,
+    dismissPendingRecovery,
+    renameProjectById,
+    duplicateProjectById,
     removeSavedProject,
+    deleteProjectsByIds,
+    moveProjectsToFolder,
+    createFolder,
+    renameFolder,
+    deleteFolder,
+    exportNativeProject,
+    importNativeProject,
     addPrimitive,
     selectObject,
     selectObjectsFromBox,

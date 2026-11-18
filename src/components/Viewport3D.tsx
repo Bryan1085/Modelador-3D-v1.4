@@ -57,6 +57,8 @@ import {
 export interface Viewport3DHandle {
   focusSelected: () => void;
   confirmMoveSlide: () => boolean;
+  captureThumbnail: () => string | null;
+  resetCamera: () => void;
 }
 
 interface Viewport3DProps {
@@ -164,6 +166,7 @@ interface Viewport3DProps {
   onOpenSettings: () => void;
   modalTransform?: ModalTransformState | null;
   modalCancelNonce?: number;
+  paused?: boolean;
   onToggleCameraRotationLock?: () => void;
   onChangeModalClamp?: (clamp: boolean) => void;
   onCancelModalTransform?: () => void;
@@ -258,6 +261,7 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
       onOpenSettings,
       modalTransform = null,
       modalCancelNonce = 0,
+      paused = false,
       onToggleCameraRotationLock,
       onChangeModalClamp,
       onCancelModalTransform,
@@ -386,9 +390,19 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
         confirmMoveSlide() {
           return engineRef.current?.confirmModalSlidePreview() ?? false;
         },
+        captureThumbnail() {
+          return engineRef.current?.captureThumbnailDataUrl(480, 320) ?? null;
+        },
+        resetCamera() {
+          engineRef.current?.resetCameraToDefault();
+        },
       }),
       [],
     );
+
+    useEffect(() => {
+      engineRef.current?.setPaused(paused);
+    }, [paused]);
 
   const handleSelectCameraPreset = useCallback(
     (preset: CameraPreset) => {
